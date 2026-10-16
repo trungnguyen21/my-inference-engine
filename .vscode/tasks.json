@@ -1,0 +1,24 @@
+{
+    "tasks": [
+        {
+            "type": "process",
+            "label": "Build CMake project",
+            "command": "/bin/sh",
+            "args": [
+                "${workspaceFolder}/build.sh"
+            ],
+            "options": {
+                "cwd": "${workspaceFolder}"
+            },
+            "problemMatcher": [
+                "$gcc"
+            ],
+            "group": {
+                "kind": "build",
+                "isDefault": true
+            },
+            "detail": "Configure and build all project sources with CMake."
+        }
+    ],
+    "version": "2.0.0"
+}

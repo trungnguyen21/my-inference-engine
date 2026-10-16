@@ -1,0 +1,65 @@
+# CMake build directories and generated files
+/build/
+/build-*/
+/cmake-build-*/
+/out/
+/CMakeFiles/
+/CMakeCache.txt
+/CMakeUserPresets.json
+/cmake_install.cmake
+/CTestTestfile.cmake
+/DartConfiguration.tcl
+/Testing/
+/_deps/
+/Makefile
+/build.ninja
+/rules.ninja
+/.ninja_deps
+/.ninja_log
+/install_manifest.txt
+/compile_commands.json
+
+# Compiled objects, libraries, executables, and debug symbols
+*.o
+*.obj
+*.a
+*.so
+*.dylib
+*.dll
+*.exe
+*.dSYM/
+/a.out
+/inference
+
+# Downloaded model weights
+/models/
+*.gguf
+
+# Profiling, coverage, and runtime logs
+*.profraw
+*.profdata
+*.gcda
+*.gcno
+*.trace/
+*.log
+engine-profile*.txt
+engine-sample*.txt
+
+# Local credentials and environment configuration
+.env
+.env.*
+!.env.example
+!.env.template
+/.aws/
+
+# OS and editor temporary files (shared VS Code settings remain trackable)
+.DS_Store
+._*
+.idea/
+*.swp
+*.swo
+*~
+
+# Python helper caches
+__pycache__/
+*.py[cod]

@@ -1,0 +1,52 @@
+# My Own Inference Engine
+
+This is a procedural C++ implementation of a terminal text-generation engine.
+`engine.cpp` memory-maps a GGUF file, selects an architecture backend from
+`general.architecture`, and owns shared model/tokenizer lifecycle. The Qwen2
+metadata keys, tensor checks, and forward pass are isolated in
+`qwen2_architecture.cpp`. `tokenizer.cpp` delegates GGUF tokenizer behavior to
+a vocabulary-only llama.cpp adapter. CPU tensor math and the complete F32
+reference forward pass are implemented; no external inference runtime executes
+model layers. Each forward call recomputes the complete token history without
+retaining K/V results between calls.
+
+Packed embedding-row decoding, packed layer/output projections, greedy
+selection, and single-user Qwen2.5 instruction prompt formatting are implemented.
+The existing app loop prints generated token pieces and stops at EOS or the
+requested token limit. See the [roadmap to generated text](docs/roadmap-to-generated-text.md)
+for the function contracts, tests, and commands. Optimization is deferred.
+
+The [optimization roadmap](docs/optimization-roadmap.md) ranks proposed changes
+from small math fixes through one-pass prefill, KV caching, CPU kernels, and a
+GPU backend, with expected benefits and validation requirements.
+
+The full build succeeds. All 20 model-free tests pass. Three real-model checks
+are opt-in through `ENGINE_TEST_MODEL_PATH`. The local model has generated
+`Hello` for `Say hello.` with a one-token limit, and
+`The capital of France is Paris.` in the full CLI smoke check. All 23 tests
+pass with the local model configured.
+
+## Build and run
+
+```sh
+./build.sh
+./build/inference --model models/qwen-2.5.gguf --prompt "Hello" \
+  --max-tokens 16 --temperature 0 --top-p 1
+```
+
+The first build downloads a pinned llama.cpp source dependency through CMake.
+It is used for BPE tokenization and token-piece decoding only.
+
+Use `--temperature 0` for the implemented greedy sampler. The CLI default
+is still `0.8`; nonzero-temperature/top-p sampling reports a clear unsupported
+error until that later feature is implemented. Full-prefix recomputation can
+make prefill and generation slow.
+
+The CLI accepts `--max-tokens`, `--temperature`, and `--top-p`; run with
+`--help` to see defaults and accepted values. `src/app.cpp` contains a separate
+prompt-prefill loop and token-decode loop. The detailed implementation map and
+checklist are in [PROJECT_GUIDE.md](PROJECT_GUIDE.md).
+
+Metrics report generation elapsed time, throughput, process CPU percentage,
+and current resident RAM when supported by macOS or Linux. CPU percentage can
+exceed 100% when multiple cores are used.
