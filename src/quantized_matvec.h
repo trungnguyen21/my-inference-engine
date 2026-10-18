@@ -11,6 +11,7 @@
  * dimensions[1] is the number of rows. input has input_count values and
  * output has output_count values. Require input_count == dimensions[0] and
  * output_count == dimensions[1]. Both dimensions must fit in int.
+ * Output must not overlap the input vector or packed matrix storage.
  *
  * Accept only Q5_0, Q8_0, Q4_K, and Q6_K views. The column count must divide
  * evenly by matrix->block_elements. Verify the view's element_count,
@@ -21,8 +22,12 @@
  * matrix->data is a byte pointer, so copy each raw block into a local correctly
  * aligned Q5_0Block, Q8_0Block, Q4_KBlock, or Q6_KBlock with memcpy before
  * calling its dot function. Do not allocate memory or call a block decoder.
+ * With OpenMP enabled, distribute independent rows across workers; each row's
+ * accumulation order stays unchanged. Combine worker failures after all rows
+ * finish. Output contents are unspecified on failure.
  * Return 0 for null pointers, invalid views, mismatched shapes/counts, or an
- * unsupported type. Otherwise return 1 after writing every output value.
+ * unsupported type or failed block dot. Otherwise return 1 after writing every
+ * output value.
  */
 int quantized_tensor_matvec_f32(
     const GgufQuantizedTensorView *matrix,

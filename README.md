@@ -50,6 +50,25 @@ recomputes the full token history on each forward call.
 The first build downloads a pinned llama.cpp source dependency through CMake.
 It is used for BPE tokenization and token-piece decoding only.
 
+OpenMP is enabled by default for the engine's CPU kernels. On macOS, install
+the runtime with `brew install libomp`; CMake discovers the standard Apple
+Silicon and Intel Homebrew locations automatically. For a custom installation,
+pass `-DOpenMP_ROOT=/path/to/libomp` when configuring. Configuration fails if
+OpenMP is enabled but its compiler support or runtime cannot be found.
+
+Set the CPU worker count when launching the executable, for example:
+
+```sh
+OMP_NUM_THREADS=4 ./build/inference --model models/qwen-2.5.gguf \
+  --prompt "Hello" --max-tokens 16 --temperature 0 --top-p 1 --profile
+```
+
+To build serial CPU kernels, configure with
+`cmake -S . -B build -DENGINE_OPENMP=OFF` and rebuild. Re-enable with
+`-DENGINE_OPENMP=ON`. Both F32 and packed quantized matvecs parallelize their
+independent output rows. Q5_0, Q8_0, Q4_K, and Q6_K keep their existing unpacking
+and accumulation order within each row.
+
 Use `--temperature 0` for the implemented greedy sampler. The CLI default
 is still `0.8`; nonzero-temperature/top-p sampling reports a clear unsupported
 error until that later feature is implemented. Full-prefix recomputation can
@@ -69,7 +88,8 @@ exceed 100% when multiple cores are used.
 Add `--profile` to collect and print an operation breakdown after generation:
 
 ```sh
-./build/inference --model models/qwen-2.5.gguf --prompt "What's the capital of France?" --max-tokens 16 --temperature 0 --top-p 1 --profile
+./build/inference --model models/qwen-2.5.gguf --prompt "What's the capital of France?" \
+  --max-tokens 16 --temperature 0 --top-p 1 --profile
 ```
 
 The report shows accumulated milliseconds and percentages for layer matvecs

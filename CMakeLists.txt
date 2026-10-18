@@ -10,6 +10,22 @@ set(CMAKE_CXX_EXTENSIONS OFF)
 # Let editors use the same include paths and compiler flags as the build.
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 
+option(ENGINE_OPENMP "Enable OpenMP parallel CPU kernels" ON)
+if(ENGINE_OPENMP)
+    # Homebrew's keg-only libomp is outside Apple Clang's default search paths.
+    # OpenMP_ROOT also accepts a custom prefix supplied with -DOpenMP_ROOT=...
+    if(APPLE)
+        list(APPEND OpenMP_ROOT
+            "/opt/homebrew/opt/libomp"
+            "/usr/local/opt/libomp"
+        )
+    endif()
+    find_package(OpenMP REQUIRED COMPONENTS CXX)
+    message(STATUS "Engine OpenMP: enabled")
+else()
+    message(STATUS "Engine OpenMP: disabled (serial CPU kernels)")
+endif()
+
 # Optional local model used by the real-GGUF CTest checks. Leave empty when
 # sharing the project or building without the downloaded model; CTest will
 # list those checks as disabled instead of trying an invented path.
@@ -259,6 +275,18 @@ if(BUILD_TESTING)
         NAME quantized_matvec_reference_test
         COMMAND quantized_matvec_reference_test
     )
+
+    add_executable(quantized_matvec_failure_test
+        tests/quantized_matvec_failure_test.cpp
+        src/quantized_matvec.cpp
+    )
+    target_include_directories(quantized_matvec_failure_test PRIVATE include src)
+    if(MSVC)
+        target_compile_options(quantized_matvec_failure_test PRIVATE /W4 /UNDEBUG)
+    else()
+        target_compile_options(quantized_matvec_failure_test PRIVATE -Wall -Wextra -Wpedantic -UNDEBUG)
+    endif()
+    add_test(NAME quantized_matvec_failure_test COMMAND quantized_matvec_failure_test)
 
     # This reference test covers the completed local numerical helpers used by
     # the Milestone 06 transformer forward path.
@@ -518,4 +546,28 @@ if(BUILD_TESTING)
     else()
         target_compile_options(real_model_quantized_check PRIVATE -Wall -Wextra -Wpedantic)
     endif()
+endif()
+
+# Match the executable and all checks that compile F32 or packed matvec kernels.
+# The imported target supplies compiler flags, headers, and runtime linkage.
+if(ENGINE_OPENMP)
+    foreach(engine_target IN ITEMS
+        inference
+        tensor_reference_test
+        quantized_matvec_reference_test
+        quantized_matvec_failure_test
+        transformer_ops_reference_test
+        inference_state_contract_test
+        forward_reference_test
+        qwen2_weight_reference_test
+        forward_quantized_reference_test
+        prompt_format_reference_test
+        real_model_schema_check
+        real_model_forward_check
+        real_model_quantized_check
+    )
+        if(TARGET ${engine_target})
+            target_link_libraries(${engine_target} PRIVATE OpenMP::OpenMP_CXX)
+        endif()
+    endforeach()
 endif()

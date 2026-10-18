@@ -57,7 +57,9 @@ int tensor_matvec_f32(
     if ((rows <= 0) || (columns <= 0)) {
         return 0;
     }
-
+#ifdef _OPENMP
+#pragma omp parallel for schedule(static)
+#endif
     for (int i = 0; i < rows; i ++) {
         float row_sum = 0.0f;
         for (int j = 0; j < columns; j++) {
