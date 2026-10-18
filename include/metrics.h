@@ -1,6 +1,21 @@
 #ifndef INFERENCE_METRICS_H
 #define INFERENCE_METRICS_H
 
+/* Per-request wall-clock totals. Forward stages exclude sampling, and the
+ * output projection is separate from transformer-layer matrix products. */
+typedef struct OperationProfile {
+    int enabled;
+    double matvec_seconds;
+    double attention_seconds;
+    double rmsnorm_seconds;
+    double rope_seconds;
+    double output_seconds;
+    double sampling_seconds;
+    double forward_seconds;
+    unsigned long long forward_calls;
+    unsigned long long sampling_calls;
+} OperationProfile;
+
 typedef struct UsageSnapshot {
     double wall_seconds;
     double process_cpu_seconds;

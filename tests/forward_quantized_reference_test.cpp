@@ -138,6 +138,16 @@ static void compare_logits(const InferenceState *actual, const InferenceState *e
     }
 }
 
+static void assert_disabled_profile(const OperationProfile *profile)
+{
+    assert(profile->enabled == 0);
+    assert(profile->matvec_seconds == 0.0 && profile->attention_seconds == 0.0);
+    assert(profile->rmsnorm_seconds == 0.0 && profile->rope_seconds == 0.0);
+    assert(profile->output_seconds == 0.0 && profile->sampling_seconds == 0.0);
+    assert(profile->forward_seconds == 0.0);
+    assert(profile->forward_calls == 0 && profile->sampling_calls == 0);
+}
+
 int main(int argc, char **argv)
 {
     int packed_parts = PACK_EMBEDDING | PACK_LAYERS | PACK_OUTPUT;
@@ -158,14 +168,34 @@ int main(int argc, char **argv)
     initialize_fixture(&reference, 0);
     InferenceState state = {};
     InferenceState expected = {};
+    InferenceState profiled = {};
     char error[512] = {};
     const ArchitectureOps *ops = qwen2_architecture_ops();
     assert(ops->state_init(&actual.model, &state, 3, error, sizeof(error)) == 1);
     assert(ops->state_init(&reference.model, &expected, 3, error, sizeof(error)) == 1);
+    assert(ops->state_init(&actual.model, &profiled, 3, error, sizeof(error)) == 1);
+    profiled.profile.enabled = 1;
+    double previous_forward_seconds = 0.0;
     for (int token = 0; token < 2; ++token) {
         forward_success(&reference, &expected, token);
         forward_success(&actual, &state, token);
         compare_logits(&state, &expected);
+        forward_success(&actual, &profiled, token);
+        assert(memcmp(state.logits, profiled.logits, VOCAB * sizeof(float)) == 0);
+        assert_disabled_profile(&state.profile);
+        assert(profiled.profile.forward_calls == (unsigned long long)token + 1);
+        assert(profiled.profile.forward_seconds > previous_forward_seconds);
+        assert(profiled.profile.matvec_seconds > 0.0);
+        assert(profiled.profile.attention_seconds > 0.0);
+        assert(profiled.profile.rmsnorm_seconds > 0.0);
+        assert(profiled.profile.rope_seconds > 0.0);
+        assert(profiled.profile.output_seconds > 0.0);
+        assert(profiled.profile.sampling_seconds == 0.0);
+        double stages = profiled.profile.matvec_seconds + profiled.profile.attention_seconds +
+                        profiled.profile.rmsnorm_seconds + profiled.profile.rope_seconds +
+                        profiled.profile.output_seconds;
+        assert(stages <= profiled.profile.forward_seconds);
+        previous_forward_seconds = profiled.profile.forward_seconds;
         assert(((Qwen2InferenceState *)state.implementation)->token_count == token + 1);
     }
 
@@ -174,11 +204,16 @@ int main(int argc, char **argv)
     assert(strcmp(output->name, "output.weight") == 0);
     output->dimensions[0] -= 1;
     assert(ops->forward_token(&actual.model, &state, 2, error, sizeof(error)) == 0);
+    assert(ops->forward_token(&actual.model, &profiled, 2, error, sizeof(error)) == 0);
+    assert(profiled.profile.forward_calls == 2);
     assert(error[0] != '\0');
     assert(((Qwen2InferenceState *)state.implementation)->token_count == 2);
     output->dimensions[0] += 1;
     forward_success(&reference, &expected, 2);
     forward_success(&actual, &state, 2);
+    forward_success(&actual, &profiled, 2);
+    assert(profiled.profile.forward_calls == 3);
+    assert(memcmp(state.logits, profiled.logits, VOCAB * sizeof(float)) == 0);
     compare_logits(&state, &expected);
     error[0] = '\0';
     assert(ops->forward_token(&actual.model, &state, 0, error, sizeof(error)) == 0);
@@ -187,6 +222,8 @@ int main(int argc, char **argv)
 
     ops->state_destroy(&state);
     ops->state_destroy(&expected);
+    ops->state_destroy(&profiled);
+    assert_disabled_profile(&profiled.profile);
     assert(state.implementation == nullptr && state.logits == nullptr);
     assert(expected.implementation == nullptr && expected.logits == nullptr);
     free(actual.data);

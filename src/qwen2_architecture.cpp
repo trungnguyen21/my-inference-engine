@@ -3,6 +3,7 @@
 #include "qwen2_internal.h"
 #include "quantization.h"
 #include "quantized_matvec.h"
+#include "operation_timer.h"
 #include "tensor.h"
 #include "transformer_ops.h"
 
@@ -660,6 +661,8 @@ static int qwen2_forward_token(
         set_error(error, error_capacity, "Qwen2 context capacity is exhausted.");
         return 0;
     }
+    OperationProfile *profile = &state->profile;
+    OperationTimer forward_timer(profile->enabled, &profile->forward_seconds);
     private_state->token_ids[position] = token_id;
     int prefix_length = position + 1;
 
@@ -685,55 +688,70 @@ static int qwen2_forward_token(
             if (!fn_ret) {
                 return 0;
             }
-            fn_ret = tensor_rms_norm_f32(
-                act_vector_start, view.data, 
-                model->config.dim, model->config.rms_norm_epsilon, 
-                private_state->normalized
-            );
+            {
+                OperationTimer timer(profile->enabled, &profile->rmsnorm_seconds);
+                fn_ret = tensor_rms_norm_f32(
+                    act_vector_start, view.data,
+                    model->config.dim, model->config.rms_norm_epsilon,
+                    private_state->normalized
+                );
+            }
             if (!fn_ret) {
                 set_error(error, error_capacity, "Qwen2 attention RMSNorm failed.");
                 return 0;
             }
 
             // Project the query vector, then add its bias.
-            fn_ret = qwen2_layer_project(
-                file, layer, "attn_q",
-                private_state->normalized, model->config.dim,
-                private_state->query, model->config.dim,
-                private_state->matvec_output, error, error_capacity
-            );
+            {
+                OperationTimer timer(profile->enabled, &profile->matvec_seconds);
+                fn_ret = qwen2_layer_project(
+                    file, layer, "attn_q",
+                    private_state->normalized, model->config.dim,
+                    private_state->query, model->config.dim,
+                    private_state->matvec_output, error, error_capacity
+                );
+            }
             if (!fn_ret) {
                 return 0;
             }
             // Project the key vector, then add its bias.
-            fn_ret = qwen2_layer_project(
-                file, layer, "attn_k",
-                private_state->normalized, model->config.dim,
-                private_state->key, private_state->key_value_dimension,
-                private_state->matvec_output, error, error_capacity
-            );
+            {
+                OperationTimer timer(profile->enabled, &profile->matvec_seconds);
+                fn_ret = qwen2_layer_project(
+                    file, layer, "attn_k",
+                    private_state->normalized, model->config.dim,
+                    private_state->key, private_state->key_value_dimension,
+                    private_state->matvec_output, error, error_capacity
+                );
+            }
             if (!fn_ret) {
                 return 0;
             }
             // Project the value vector, then add its bias.
-            fn_ret = qwen2_layer_project(
-                file, layer, "attn_v",
-                private_state->normalized, model->config.dim,
-                private_state->value, private_state->key_value_dimension,
-                private_state->matvec_output, error, error_capacity
-            );
+            {
+                OperationTimer timer(profile->enabled, &profile->matvec_seconds);
+                fn_ret = qwen2_layer_project(
+                    file, layer, "attn_v",
+                    private_state->normalized, model->config.dim,
+                    private_state->value, private_state->key_value_dimension,
+                    private_state->matvec_output, error, error_capacity
+                );
+            }
             if (!fn_ret) {
                 return 0;
             }
             // Applying RoPE
-            fn_ret = transformer_apply_rope_f32(
-                private_state->query, model->config.n_heads,
-                private_state->key,
-                model->config.n_kv_heads,
-                private_state->head_dimension,
-                private_state->head_dimension, 
-                i, model->config.rope_frequency_base
-            );
+            {
+                OperationTimer timer(profile->enabled, &profile->rope_seconds);
+                fn_ret = transformer_apply_rope_f32(
+                    private_state->query, model->config.n_heads,
+                    private_state->key,
+                    model->config.n_kv_heads,
+                    private_state->head_dimension,
+                    private_state->head_dimension,
+                    i, model->config.rope_frequency_base
+                );
+            }
             if (!fn_ret) {
                 set_error(error, error_capacity, "Qwen2 RoPE rotation failed.");
                 return 0;
@@ -749,29 +767,35 @@ static int qwen2_forward_token(
             memcpy(dest, private_state->value, size);
 
             // apply attention
-            fn_ret = transformer_attention_f32(
-                private_state->query,
-                model->config.n_heads,
-                model->config.n_kv_heads,
-                private_state->head_dimension,
-                private_state->keys,
-                private_state->values,
-                i + 1, 
-                private_state->attention_probabilities,
-                private_state->attention_output
-            );
+            {
+                OperationTimer timer(profile->enabled, &profile->attention_seconds);
+                fn_ret = transformer_attention_f32(
+                    private_state->query,
+                    model->config.n_heads,
+                    model->config.n_kv_heads,
+                    private_state->head_dimension,
+                    private_state->keys,
+                    private_state->values,
+                    i + 1,
+                    private_state->attention_probabilities,
+                    private_state->attention_output
+                );
+            }
             if (!fn_ret) {
                 set_error(error, error_capacity, "Qwen2 grouped-query attention failed.");
                 return 0;
             }
 
             // Updating token activation
-            fn_ret = qwen2_layer_matvec(
-                file, layer, "attn_output.weight",
-                private_state->attention_output, model->config.dim,
-                private_state->matvec_output, model->config.dim,
-                error, error_capacity
-            );
+            {
+                OperationTimer timer(profile->enabled, &profile->matvec_seconds);
+                fn_ret = qwen2_layer_matvec(
+                    file, layer, "attn_output.weight",
+                    private_state->attention_output, model->config.dim,
+                    private_state->matvec_output, model->config.dim,
+                    error, error_capacity
+                );
+            }
             if (!fn_ret) {
                 return 0;
             }
@@ -798,34 +822,43 @@ static int qwen2_forward_token(
             if (!fn_ret) {
                 return 0;
             }
-            fn_ret = tensor_rms_norm_f32(
-                act_vector_start, 
-                view.data, 
-                model->config.dim, 
-                model->config.rms_norm_epsilon, 
-                private_state->normalized
-            );
+            {
+                OperationTimer timer(profile->enabled, &profile->rmsnorm_seconds);
+                fn_ret = tensor_rms_norm_f32(
+                    act_vector_start,
+                    view.data,
+                    model->config.dim,
+                    model->config.rms_norm_epsilon,
+                    private_state->normalized
+                );
+            }
             if (!fn_ret) {
                 set_error(error, error_capacity, "Qwen2 FFN RMSNorm failed.");
                 return 0;
             }
 
-            fn_ret = qwen2_layer_matvec(
-                file, layer, "ffn_gate.weight",
-                private_state->normalized, model->config.dim,
-                private_state->ffn_gate, model->config.hidden_dim,
-                error, error_capacity
-            );
+            {
+                OperationTimer timer(profile->enabled, &profile->matvec_seconds);
+                fn_ret = qwen2_layer_matvec(
+                    file, layer, "ffn_gate.weight",
+                    private_state->normalized, model->config.dim,
+                    private_state->ffn_gate, model->config.hidden_dim,
+                    error, error_capacity
+                );
+            }
             if (!fn_ret) {
                 return 0;
             }
 
-            fn_ret = qwen2_layer_matvec(
-                file, layer, "ffn_up.weight",
-                private_state->normalized, model->config.dim,
-                private_state->ffn_up, model->config.hidden_dim,
-                error, error_capacity
-            );
+            {
+                OperationTimer timer(profile->enabled, &profile->matvec_seconds);
+                fn_ret = qwen2_layer_matvec(
+                    file, layer, "ffn_up.weight",
+                    private_state->normalized, model->config.dim,
+                    private_state->ffn_up, model->config.hidden_dim,
+                    error, error_capacity
+                );
+            }
             if (!fn_ret) {
                 return 0;
             }
@@ -841,12 +874,15 @@ static int qwen2_forward_token(
             }
             
             // matvec_output = Wdown * ffn_gate
-            fn_ret = qwen2_layer_matvec(
-                file, layer, "ffn_down.weight",
-                private_state->ffn_gate, model->config.hidden_dim,
-                private_state->matvec_output, model->config.dim,
-                error, error_capacity
-            );
+            {
+                OperationTimer timer(profile->enabled, &profile->matvec_seconds);
+                fn_ret = qwen2_layer_matvec(
+                    file, layer, "ffn_down.weight",
+                    private_state->ffn_gate, model->config.hidden_dim,
+                    private_state->matvec_output, model->config.dim,
+                    error, error_capacity
+                );
+            }
             if (!fn_ret) {
                 return 0;
             }
@@ -886,23 +922,29 @@ static int qwen2_forward_token(
         return 0;
     }
 
-    fn_ret = tensor_rms_norm_f32(
-        last_activation, view.data,
-        model->config.dim, model->config.rms_norm_epsilon,
-        private_state->normalized
-    );
+    {
+        OperationTimer timer(profile->enabled, &profile->rmsnorm_seconds);
+        fn_ret = tensor_rms_norm_f32(
+            last_activation, view.data,
+            model->config.dim, model->config.rms_norm_epsilon,
+            private_state->normalized
+        );
+    }
     if (!fn_ret) {
         set_error(error, error_capacity, "Final RMSNorm failed.");
         return 0;
     }
 
 
-    fn_ret = qwen2_weight_matvec(
-        file, "output.weight",
-        private_state->normalized, model->config.dim,
-        state->logits, model->config.vocab_size,
-        error, error_capacity
-    );
+    {
+        OperationTimer timer(profile->enabled, &profile->output_seconds);
+        fn_ret = qwen2_weight_matvec(
+            file, "output.weight",
+            private_state->normalized, model->config.dim,
+            state->logits, model->config.vocab_size,
+            error, error_capacity
+        );
+    }
     if (!fn_ret) {
         return 0;
     }
@@ -915,6 +957,7 @@ static int qwen2_forward_token(
         }
     }
 
+    if (profile->enabled) ++profile->forward_calls;
     state->logits_count = model->config.vocab_size;
     private_state->token_count = prefix_length;
     if (error != nullptr && error_capacity > 0) error[0] = '\0';
@@ -946,6 +989,7 @@ static void qwen2_state_destroy(InferenceState *state)
     state->implementation = nullptr;
     state->logits = nullptr;
     state->logits_count = 0;
+    memset(&state->profile, 0, sizeof(state->profile));
 }
 
 static int qwen2_format_prompt(

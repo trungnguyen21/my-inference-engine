@@ -23,6 +23,8 @@ static std::vector<std::string> events;
 static std::string printed, reported_error;
 static int loaded, unloaded, initialized, destroyed, finished, sampled, captured;
 static int reported_tokens, requested_capacity;
+static int profiles_printed;
+static OperationProfile reported_profile;
 static float logits[7];
 
 static void reset(Failure selected, const std::vector<int> &script)
@@ -33,6 +35,8 @@ static void reset(Failure selected, const std::vector<int> &script)
     printed.clear(); reported_error.clear();
     loaded = unloaded = initialized = destroyed = finished = sampled = captured = 0;
     reported_tokens = requested_capacity = 0;
+    profiles_printed = 0;
+    memset(&reported_profile, 0, sizeof(reported_profile));
     memset(logits, 0, sizeof(logits));
 }
 
@@ -108,6 +112,11 @@ int engine_forward_token(const Model *, InferenceState *state, int id,
     logits[0] = (float)id;
     if (failure == NULL_LOGITS) state->logits = nullptr;
     if (failure == WRONG_LOGIT_COUNT) state->logits_count = 6;
+    if (state->profile.enabled) {
+        ++state->profile.forward_calls;
+        state->profile.matvec_seconds += 0.25;
+        state->profile.forward_seconds += 0.5;
+    }
     return 1;
 }
 
@@ -147,6 +156,12 @@ void terminal_finish_generation(int count, double elapsed, const UsageSnapshot *
 {
     ++finished; reported_tokens = count; assert(elapsed == 1.0);
 }
+void terminal_print_operation_profile(const OperationProfile *profile)
+{
+    assert(finished == 1 && destroyed == 0 && profile->enabled);
+    ++profiles_printed;
+    reported_profile = *profile;
+}
 void metrics_capture(UsageSnapshot *snapshot)
 {
     ++captured; memset(snapshot, 0, sizeof(*snapshot));
@@ -164,10 +179,11 @@ static AppConfig config_for(int max_tokens)
 
 static void expect_success(int limit, const std::vector<int> &script,
                            const std::vector<int> &expected_forwards,
-                           const char *text, int count)
+                           const char *text, int count, int profile = 0)
 {
     reset(NONE, script);
     AppConfig config = config_for(limit);
+    config.profile = profile;
     assert(app_run(&config) == 0);
     assert(forwards == expected_forwards && printed == text);
     assert(loaded == 1 && unloaded == 1 && initialized == 1 && destroyed == 1);
@@ -175,18 +191,35 @@ static void expect_success(int limit, const std::vector<int> &script,
     assert(requested_capacity == 2 + limit && reported_error.empty());
     assert(events[0] == "load" && events[1] == "format" && events[2] == "encode");
     assert(events[events.size() - 2] == "destroy" && events.back() == "unload");
+    assert(profiles_printed == profile);
+    if (profile) {
+        assert(reported_profile.forward_calls == forwards.size());
+        assert(reported_profile.sampling_calls == (unsigned long long)count);
+        assert(reported_profile.matvec_seconds == 0.25 * forwards.size());
+        assert(reported_profile.sampling_seconds >= 0.0);
+    }
 }
 
 static void test_cli()
 {
     AppConfig config;
     app_config_init(&config);
+    assert(config.profile == 0);
     char program[] = "inference", model[] = "--model", path[] = "x.gguf";
     char prompt[] = "--prompt", text[] = "Hi", temperature[] = "--temperature";
     char zero[] = "0", top_p[] = "--top-p", one[] = "1", nan[] = "nan";
     char max_tokens[] = "--max-tokens", negative[] = "-1", help[] = "--help";
     char *valid[] = {program, model, path, prompt, text, temperature, zero, top_p, one};
     assert(app_parse_args(9, valid, &config) == 0 && config.temperature == 0 && config.top_p == 1);
+    char profile[] = "--profile";
+    char *profile_first[] = {program, profile, model, path, prompt, text};
+    assert(app_parse_args(6, profile_first, &config) == 0 && config.profile == 1);
+    app_config_init(&config);
+    char *profile_last[] = {program, model, path, prompt, text, profile};
+    assert(app_parse_args(6, profile_last, &config) == 0 && config.profile == 1);
+    char unexpected[] = "true";
+    char *bad_profile[] = {program, model, path, prompt, text, profile, unexpected};
+    assert(app_parse_args(7, bad_profile, &config) == -1);
     char *bad_float[] = {program, model, path, prompt, text, temperature, nan};
     assert(app_parse_args(7, bad_float, &config) == -1);
     char *bad_count[] = {program, model, path, prompt, text, max_tokens, negative};
@@ -207,15 +240,24 @@ int main()
     expect_success(4, {3, 6}, {1, 2, 3}, "Par", 2);
     assert((decoded == std::vector<int>{3}));
 
-    for (int selected = LOAD; selected <= WRONG_LOGIT_COUNT; ++selected) {
-        reset((Failure)selected, {3, 4});
-        AppConfig config = config_for(2);
-        assert(app_run(&config) == 1);
-        assert(loaded == 1 && unloaded == 1 && finished == 0 && !reported_error.empty());
-        const bool attempted_init = selected >= INIT;
-        assert(initialized == (int)attempted_init && destroyed == (int)attempted_init);
-        assert(events.back() == "unload");
-        assert(printed == (selected == DECODE_FORWARD ? "Par" : ""));
+    expect_success(2, {3, 4}, {1, 2, 3}, "Paris", 2, 1);
+    expect_success(1, {3}, {1, 2}, "Par", 1, 1);
+    expect_success(4, {6}, {1, 2}, "", 1, 1);
+    expect_success(4, {3, 6}, {1, 2, 3}, "Par", 2, 1);
+
+    for (int profile = 0; profile <= 1; ++profile) {
+        for (int selected = LOAD; selected <= WRONG_LOGIT_COUNT; ++selected) {
+            reset((Failure)selected, {3, 4});
+            AppConfig config = config_for(2);
+            config.profile = profile;
+            assert(app_run(&config) == 1);
+            assert(loaded == 1 && unloaded == 1 && finished == 0 && !reported_error.empty());
+            const bool attempted_init = selected >= INIT;
+            assert(initialized == (int)attempted_init && destroyed == (int)attempted_init);
+            assert(events.back() == "unload");
+            assert(printed == (selected == DECODE_FORWARD ? "Par" : ""));
+            assert(profiles_printed == 0);
+        }
     }
     test_cli();
     puts("App generation sequencing, EOS, limits, errors, cleanup, and CLI passed.");

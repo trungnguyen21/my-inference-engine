@@ -63,3 +63,26 @@ checklist are in [PROJECT_GUIDE.md](PROJECT_GUIDE.md).
 Metrics report generation elapsed time, throughput, process CPU percentage,
 and current resident RAM when supported by macOS or Linux. CPU percentage can
 exceed 100% when multiple cores are used.
+
+### Operation timings
+
+Add `--profile` to collect and print an operation breakdown after generation:
+
+```sh
+./build/inference --model models/qwen-2.5.gguf --prompt "What's the capital of France?" --max-tokens 16 --temperature 0 --top-p 1 --profile
+```
+
+The report shows accumulated milliseconds and percentages for layer matvecs
+(Q/K/V, attention output, and FFN projections), attention scores/softmax/value
+aggregation, RMSNorm, RoPE, and the output matrix plus sampling. Output projection
+time is excluded from the layer matvec row. Projection timings include weight
+lookup, storage dispatch, and Q/K/V bias addition.
+
+Totals cover **prompt prefill and generation**, including full-prefix
+recomputation, across all forward and sampling calls. Percentages use total
+forward time plus sampling time; an **other forward work** row accounts for
+embeddings, SwiGLU, residual additions, copies, validation, and instrumentation
+overhead. Loading, tokenization, and terminal output are excluded. These totals
+therefore cover a different interval from the existing generation-only elapsed
+time and throughput. Timings use a monotonic wall clock and can include OS
+scheduling delays. Omitting `--profile` disables operation timing and its report.

@@ -382,7 +382,9 @@ if(BUILD_TESTING)
 
     add_executable(sampler_greedy_test tests/sampler_greedy_test.cpp src/sampler.cpp)
     add_executable(app_generation_contract_test tests/app_generation_contract_test.cpp src/app.cpp)
-    foreach(checkpoint IN ITEMS sampler_greedy_test app_generation_contract_test)
+    add_executable(operation_profile_report_test
+        tests/operation_profile_report_test.cpp src/terminal.cpp src/metrics.cpp)
+    foreach(checkpoint IN ITEMS sampler_greedy_test app_generation_contract_test operation_profile_report_test)
         target_include_directories(${checkpoint} PRIVATE include src)
         if(MSVC)
             target_compile_options(${checkpoint} PRIVATE /W4 /UNDEBUG)
@@ -400,6 +402,7 @@ if(BUILD_TESTING)
     add_test(NAME sampler_validation_test COMMAND sampler_greedy_test validation)
     add_test(NAME prompt_dispatch_test COMMAND prompt_format_reference_test dispatch)
     add_test(NAME app_generation_contract_test COMMAND app_generation_contract_test)
+    add_test(NAME operation_profile_report_test COMMAND operation_profile_report_test)
     set_tests_properties(sampler_validation_test prompt_dispatch_test app_generation_contract_test
         PROPERTIES LABELS "milestone07-infrastructure")
 

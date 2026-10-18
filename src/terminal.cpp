@@ -51,3 +51,36 @@ void terminal_print_error(const char *message)
 {
     fprintf(stderr, "\n\033[1;31mError:\033[0m %s\n", message);
 }
+
+void terminal_print_operation_profile(const OperationProfile *profile)
+{
+    if (profile == NULL || !profile->enabled) return;
+
+    double stages = profile->matvec_seconds + profile->attention_seconds +
+                    profile->rmsnorm_seconds + profile->rope_seconds +
+                    profile->output_seconds;
+    double other = profile->forward_seconds > stages ?
+                   profile->forward_seconds - stages : 0.0;
+    const double seconds[] = {
+        profile->matvec_seconds, profile->attention_seconds,
+        profile->rmsnorm_seconds, profile->rope_seconds,
+        profile->output_seconds + profile->sampling_seconds, other
+    };
+    const char *labels[] = {
+        "matvec (projections + FFN)", "attention (scores/softmax/V)",
+        "RMSNorm", "RoPE", "output matrix + sampling", "other forward work"
+    };
+    double total = 0.0;
+    for (int i = 0; i < 6; ++i) total += seconds[i];
+
+    printf("\nOperation profile (prefill + decode)\n");
+    printf("Forward calls: %llu | Sampling calls: %llu\n",
+           profile->forward_calls, profile->sampling_calls);
+    printf("%-30s %12s %9s\n", "Operation", "Time (ms)", "Share");
+    for (int i = 0; i < 6; ++i) {
+        printf("%-30s %12.3f %8.2f%%\n", labels[i], seconds[i] * 1000.0,
+               total > 0.0 ? seconds[i] / total * 100.0 : 0.0);
+    }
+    printf("%-30s %12.3f\n", "Total profiled time", total * 1000.0);
+    printf("Excludes model loading, tokenization, and terminal output.\n");
+}

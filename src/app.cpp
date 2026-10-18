@@ -2,6 +2,7 @@
 
 #include "engine.h"
 #include "metrics.h"
+#include "operation_timer.h"
 #include "terminal.h"
 
 #include <errno.h>
@@ -65,6 +66,7 @@ void app_print_usage(const char *program_name)
             "  --max-tokens N   Maximum generated tokens (default: 128)\n"
             "  --temperature X  Sampling temperature in [0, 1] (default: 0.8)\n"
             "  --top-p X        Nucleus sampling threshold in [0, 1] (default: 0.95)\n"
+            "  --profile        Collect and display operation timings (prefill + decode)\n"
             "  --help           Show this help\n",
             program_name);
 }
@@ -81,6 +83,10 @@ int app_parse_args(int argc, char **argv, AppConfig *config)
         if (strcmp(option, "--help") == 0 || strcmp(option, "-h") == 0) {
             app_print_usage(argv[0]);
             return 1;
+        }
+        if (strcmp(option, "--profile") == 0) {
+            config->profile = 1;
+            continue;
         }
         if (i + 1 >= argc) {
             fprintf(stderr, "Missing value for %s\n", option);
@@ -207,6 +213,8 @@ int app_run(const AppConfig *config)
         goto cleanup;
     }
 
+    state.profile.enabled = config->profile;
+
     /* Prefill: forward each prompt token once; retain the last token's logits. */
     for (i = 0; i < prompt_token_count; ++i) {
         if (!engine_forward_token(&model, &state, prompt_token_ids[i],
@@ -228,9 +236,14 @@ int app_run(const AppConfig *config)
             terminal_print_error("Model forward pass returned invalid logits.");
             goto cleanup;
         }
-        if (!sampler_sample(state.logits, state.logits_count,
-                            config->temperature, config->top_p, &token_id,
-                            error, sizeof(error))) {
+        int sample_result;
+        {
+            OperationTimer timer(state.profile.enabled, &state.profile.sampling_seconds);
+            sample_result = sampler_sample(state.logits, state.logits_count,
+                                           config->temperature, config->top_p, &token_id,
+                                           error, sizeof(error));
+        }
+        if (!sample_result) {
             terminal_print_error(error);
             goto cleanup;
         }
@@ -238,6 +251,7 @@ int app_run(const AppConfig *config)
             terminal_print_error("Sampler returned a token ID outside the vocabulary.");
             goto cleanup;
         }
+        if (state.profile.enabled) ++state.profile.sampling_calls;
         ++generated_tokens;
         if (tokenizer_is_eos(&model, token_id)) {
             break;
@@ -266,6 +280,7 @@ int app_run(const AppConfig *config)
     terminal_finish_generation(generated_tokens,
                                metrics_elapsed_seconds(&start_usage, &end_usage),
                                &start_usage, &end_usage);
+    if (config->profile) terminal_print_operation_profile(&state.profile);
     exit_code = 0;
 
 cleanup:

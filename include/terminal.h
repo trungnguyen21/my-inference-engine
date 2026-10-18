@@ -11,5 +11,6 @@ void terminal_finish_generation(int generated_tokens, double elapsed_seconds,
                                 const UsageSnapshot *start,
                                 const UsageSnapshot *end);
 void terminal_print_error(const char *message);
+void terminal_print_operation_profile(const OperationProfile *profile);
 
 #endif

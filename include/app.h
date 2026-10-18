@@ -10,6 +10,7 @@ typedef struct AppConfig {
     int max_tokens;
     float temperature;
     float top_p;
+    int profile; /* collect and print operation timings; disabled by default */
 } AppConfig;
 
 void app_config_init(AppConfig *config);

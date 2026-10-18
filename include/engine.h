@@ -2,6 +2,7 @@
 #define INFERENCE_ENGINE_H
 
 #include "app.h"
+#include "metrics.h"
 
 #define TOKEN_TEXT_CAPACITY 257
 #define ENGINE_ERROR_CAPACITY 512
@@ -27,6 +28,7 @@ typedef struct InferenceState {
     void *implementation; // private token history and temporary workspace
     float *logits;        // one score per vocabulary token after a forward call
     int logits_count;     // must equal ModelConfig.vocab_size on forward success
+    OperationProfile profile; // enable after init; totals accumulate per state
 } InferenceState;
 
 /* Parse GGUF metadata/tensors and retain model/tokenizer data for later steps. */
