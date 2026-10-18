@@ -20,11 +20,24 @@ The [optimization roadmap](docs/optimization-roadmap.md) ranks proposed changes
 from small math fixes through one-pass prefill, KV caching, CPU kernels, and a
 GPU backend, with expected benefits and validation requirements.
 
-The full build succeeds. All 20 model-free tests pass. Three real-model checks
-are opt-in through `ENGINE_TEST_MODEL_PATH`. The local model has generated
-`Hello` for `Say hello.` with a one-token limit, and
-`The capital of France is Paris.` in the full CLI smoke check. All 23 tests
-pass with the local model configured.
+## Inside the engine
+
+### Grouped-query attention
+
+The Qwen2 backend implements grouped-query attention: groups of query heads
+share key and value heads. The diagram uses illustrative head counts to show
+how this layout reduces the K/V storage needed compared with multi-head attention.
+
+![Multi-head and grouped-query attention compared, showing query heads sharing K/V heads](media/grouped_query_attention.png)
+
+### Prefill, decode, and KV caching
+
+The animation shows prompt prefill followed by token-by-token decoding with
+a persistent KV cache. KV caching and one-pass prefill are planned in the
+[optimization roadmap](docs/optimization-roadmap.md); the current backend
+recomputes the full token history on each forward call.
+
+![Animation of prompt prefill and autoregressive decoding with a growing KV cache](media/prefill_decode_kv_cache.gif)
 
 ## Build and run
 
