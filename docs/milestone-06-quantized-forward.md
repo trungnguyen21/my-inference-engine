@@ -158,12 +158,10 @@ then checks context exhaustion and destroys both inference states.
 ./build/forward_quantized_reference_test mixed
 ```
 
-The existing [`real_model_forward_check.cpp`](../tests/real_model_forward_check.cpp)
-is the acceptance check against `models/qwen-2.5.gguf`. It checks tokenization,
-prefill, finite vocabulary-sized logits, rejection of invalid IDs without
-consuming context, one further valid forward, context exhaustion, and cleared
-state/model ownership after cleanup. It passes with the local model and
-reports two forwarded tokens and 151,936 finite logits.
+Historical acceptance against `models/qwen-2.5.gguf` checked tokenization,
+prefill, finite vocabulary-sized logits, invalid IDs, context exhaustion, and
+cleanup. That real-model test has been removed. Current automated coverage uses
+the synthetic forward fixtures and scripted app backend.
 
 ## Build and acceptance commands
 
@@ -172,24 +170,19 @@ cmake --build build --parallel
 
 # Completed-code checks: 12 earlier regressions plus 3 app/dispatch checks.
 ctest --test-dir build \
-  -LE 'milestone06-quantized|milestone07-exercises|requires-local-model' \
+  -LE 'milestone06-quantized|milestone07-exercises' \
   --output-on-failure
 
 # Packed embedding, dispatcher, and mixed-weight forward regressions.
 ctest --test-dir build -L milestone06-quantized --output-on-failure
 
-# Run the actual model check directly once the synthetic checkpoints pass.
-./build/real_model_forward_check models/qwen-2.5.gguf
-
-# Enable local-model checks, then run through Milestone 06 only.
-cmake -S . -B build -DENGINE_TEST_MODEL_PATH=models/qwen-2.5.gguf
-cmake --build build --parallel
-ctest --test-dir build -LE milestone07 --output-on-failure
+# Run the small synthetic integration checks.
+ctest --test-dir build -L '^integration$' --output-on-failure
 ```
 
 The [next milestone](milestone-07-first-generated-text.md) has separate greedy
-selection and prompt-formatting exercises. Its real CLI smoke test is also
-enabled by `ENGINE_TEST_MODEL_PATH`, but is excluded by the Milestone 06 command.
+selection and prompt-formatting exercises. Real CLI generation is an optional
+manual exercise, outside the automated test suite.
 
 ## Completion checklist
 

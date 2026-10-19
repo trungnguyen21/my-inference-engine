@@ -59,15 +59,16 @@ math, F32/packed forward execution, greedy sampling, and single-user Qwen
 prompt formatting are implemented. The generation loop has deterministic
 sequencing, EOS, limit, and cleanup tests.
 
-The full build and all 20 model-free tests pass, including the packed embedding,
-weight-dispatch, mixed-weight forward, greedy sampler, and exact prompt tests.
-Packed embedding and projection checks also pass AddressSanitizer and
-UndefinedBehaviorSanitizer. Three real-model checks are opt-in through
-`ENGINE_TEST_MODEL_PATH`. The local forward check passes with 151,936 finite
-logits and validates rejected inputs, context exhaustion, and cleanup. The real
-CLI prints `Hello` for `Say hello.` with a one-token limit. The full smoke
-check prints `The capital of France is Paris.` All 23 tests pass with the local
-model configured (2026-10-16); that full CLI run took about 12 minutes.
+The automated suite contains 18 unit tests and four small integration tests.
+They use synthetic fixtures and scripted backends, including a three-token,
+four-dimensional cached-vs-full-prefix comparison. Real-model checks and their
+build targets have been removed. See the [test commands](README.md#tests).
+
+Historical acceptance on 2026-10-16 included 151,936 finite real-model logits,
+context/lifecycle checks, and the CLI responses `Hello` and
+`The capital of France is Paris.` That full CLI check took about 12 minutes;
+it is no longer part of the automated suite. Packed embedding and projection
+checks also passed AddressSanitizer and UndefinedBehaviorSanitizer.
 
 The [quantized forward contracts](docs/milestone-06-quantized-forward.md) and
 [Milestone 07 guide](docs/milestone-07-first-generated-text.md) describe the

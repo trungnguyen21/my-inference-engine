@@ -1,5 +1,9 @@
 # Milestone 05H: Real-Model Quantized Integration Check
 
+This document records a completed historical acceptance check. The real-model
+executable has been removed; current automated tests use small synthetic
+fixtures. See [current test commands](../README.md#tests).
+
 ## Goal
 
 Validate the completed packed-tensor path against the downloaded Qwen GGUF:
@@ -27,14 +31,14 @@ multiple rows start at distinct packed-byte offsets.
 
 ## Run
 
-Complete 05D through 05G first, then run:
+For current regression coverage of the packed tensor and matvec paths, run:
 
 ```sh
-cmake --build build --target real_model_quantized_check
-./build/real_model_quantized_check models/qwen-2.5.gguf
+ctest --test-dir build \
+  -R 'gguf_quantized_view_test|quantized_matvec_reference_test' --output-on-failure
 ```
 
-It prints the selected tensor name, type, row width, and calculated value for
+The historical executable printed the selected tensor name, type, row width, and calculated value for
 each format. The values are a structural check, so they do not have a fixed
 expected number across different model files.
 

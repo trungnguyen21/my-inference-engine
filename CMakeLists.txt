@@ -26,21 +26,6 @@ else()
     message(STATUS "Engine OpenMP: disabled (serial CPU kernels)")
 endif()
 
-# Optional local model used by the real-GGUF CTest checks. Leave empty when
-# sharing the project or building without the downloaded model; CTest will
-# list those checks as disabled instead of trying an invented path.
-set(ENGINE_TEST_MODEL_PATH "" CACHE FILEPATH
-    "Path to a local GGUF model for real-model CTest checks")
-set(ENGINE_TEST_MODEL_PATH_ABSOLUTE "")
-if(ENGINE_TEST_MODEL_PATH)
-    get_filename_component(
-        ENGINE_TEST_MODEL_PATH_ABSOLUTE
-        "${ENGINE_TEST_MODEL_PATH}"
-        ABSOLUTE
-        BASE_DIR "${CMAKE_CURRENT_SOURCE_DIR}"
-    )
-endif()
-
 # llama.cpp is used only for its GGUF-aware tokenizer API. The inference
 # executable continues to load weights and run model math through this project.
 set(LLAMA_BUILD_COMMON OFF CACHE BOOL "" FORCE)
@@ -434,118 +419,23 @@ if(BUILD_TESTING)
     set_tests_properties(sampler_validation_test prompt_dispatch_test app_generation_contract_test
         PROPERTIES LABELS "milestone07-infrastructure")
 
-    add_test(NAME real_text_generation_check
-        COMMAND "${CMAKE_COMMAND}"
-            "-DINFERENCE_EXECUTABLE=$<TARGET_FILE:inference>"
-            "-DMODEL_PATH=${ENGINE_TEST_MODEL_PATH_ABSOLUTE}"
-            -P "${CMAKE_CURRENT_SOURCE_DIR}/tests/real_text_generation_check.cmake")
-    set_tests_properties(real_text_generation_check
-        PROPERTIES LABELS "requires-local-model;milestone07-real-text")
-    if(NOT ENGINE_TEST_MODEL_PATH_ABSOLUTE)
-        set_tests_properties(real_text_generation_check PROPERTIES DISABLED TRUE)
-    endif()
-
-    # This opt-in Stage 1 acceptance check requires the local Qwen GGUF file.
-    add_executable(real_model_schema_check
-        tests/real_model_schema_check.cpp
-        src/engine.cpp
-        src/architecture.cpp
-        src/qwen2_architecture.cpp
-        src/tensor.cpp
-        src/transformer_ops.cpp
-        src/quantization.cpp
-        src/quantized_matvec.cpp
-        src/tokenizer.cpp
-        src/gguf_reader.cpp
+    # All automated checks use small synthetic fixtures or scripted backends.
+    # Keep the few cross-component checks selectable separately from unit tests.
+    set(engine_integration_tests
+        inference_state_contract_test
+        forward_reference_test
+        forward_quantized_reference_test
+        app_generation_contract_test
     )
-
-    target_include_directories(real_model_schema_check PRIVATE include src)
-    target_link_libraries(real_model_schema_check PRIVATE llama)
-
-    if(APPLE OR CMAKE_SYSTEM_NAME STREQUAL "Linux")
-        target_compile_definitions(real_model_schema_check PRIVATE _POSIX_C_SOURCE=200809L)
-    endif()
-
-    if(MSVC)
-        target_compile_options(real_model_schema_check PRIVATE /W4)
-    else()
-        target_compile_options(real_model_schema_check PRIVATE -Wall -Wextra -Wpedantic)
-    endif()
-
-    # This opt-in executable needs the local GGUF file supplied at runtime.
-    # It becomes the final structural forward-pass check for Milestone 06.
-    add_executable(real_model_forward_check
-        tests/real_model_forward_check.cpp
-        src/engine.cpp
-        src/architecture.cpp
-        src/qwen2_architecture.cpp
-        src/sampler.cpp
-        src/transformer_ops.cpp
-        src/tokenizer.cpp
-        src/gguf_reader.cpp
-        src/tensor.cpp
-        src/quantization.cpp
-        src/quantized_matvec.cpp
-    )
-
-    target_include_directories(real_model_forward_check PRIVATE include src)
-    target_link_libraries(real_model_forward_check PRIVATE llama)
-
-    if(APPLE OR CMAKE_SYSTEM_NAME STREQUAL "Linux")
-        target_compile_definitions(real_model_forward_check PRIVATE _POSIX_C_SOURCE=200809L)
-    endif()
-
-    if(MSVC)
-        target_compile_options(real_model_forward_check PRIVATE /W4)
-    else()
-        target_compile_options(real_model_forward_check PRIVATE -Wall -Wextra -Wpedantic)
-    endif()
-
-    if(ENGINE_TEST_MODEL_PATH_ABSOLUTE)
-        add_test(
-            NAME real_model_schema_check
-            COMMAND real_model_schema_check "${ENGINE_TEST_MODEL_PATH_ABSOLUTE}"
-        )
-        add_test(
-            NAME real_model_forward_check
-            COMMAND real_model_forward_check "${ENGINE_TEST_MODEL_PATH_ABSOLUTE}"
-        )
-    else()
-        add_test(
-            NAME real_model_schema_check
-            COMMAND real_model_schema_check
-        )
-        add_test(
-            NAME real_model_forward_check
-            COMMAND real_model_forward_check
-        )
-        set_tests_properties(
-            real_model_schema_check
-            real_model_forward_check
-            PROPERTIES
-                DISABLED TRUE
-                LABELS "requires-local-model"
-        )
-    endif()
-
-    add_executable(real_model_quantized_check
-        tests/real_model_quantized_check.cpp
-        src/gguf_reader.cpp
-        src/quantized_matvec.cpp
-        src/quantization.cpp
-    )
-
-    target_include_directories(real_model_quantized_check PRIVATE include src)
-
-    if(APPLE OR CMAKE_SYSTEM_NAME STREQUAL "Linux")
-        target_compile_definitions(real_model_quantized_check PRIVATE _POSIX_C_SOURCE=200809L)
-    endif()
-
-    if(MSVC)
-        target_compile_options(real_model_quantized_check PRIVATE /W4)
-    else()
-        target_compile_options(real_model_quantized_check PRIVATE -Wall -Wextra -Wpedantic)
-    endif()
+    get_property(engine_tests DIRECTORY PROPERTY TESTS)
+    foreach(engine_test IN LISTS engine_tests)
+        if(engine_test IN_LIST engine_integration_tests)
+            set_property(TEST ${engine_test} APPEND PROPERTY LABELS integration)
+        else()
+            set_property(TEST ${engine_test} APPEND PROPERTY LABELS unit)
+        endif()
+        set_tests_properties(${engine_test} PROPERTIES TIMEOUT 30)
+    endforeach()
 endif()
 
 # Match the executable and all checks that compile F32 or packed matvec kernels.
@@ -562,9 +452,6 @@ if(ENGINE_OPENMP)
         qwen2_weight_reference_test
         forward_quantized_reference_test
         prompt_format_reference_test
-        real_model_schema_check
-        real_model_forward_check
-        real_model_quantized_check
     )
         if(TARGET ${engine_target})
             target_link_libraries(${engine_target} PRIVATE OpenMP::OpenMP_CXX)

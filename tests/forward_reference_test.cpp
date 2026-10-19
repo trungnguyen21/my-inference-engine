@@ -8,6 +8,7 @@
 #include "architecture.h"
 #include "engine_internal.h"
 #include "gguf_reader.h"
+#include "qwen2_internal.h"
 
 static const float EPSILON = 0.0001f;
 static const int FIXTURE_DIM = 4;
@@ -233,6 +234,50 @@ static void test_two_token_full_prefix_forward(void)
     inference_state_destroy(&state);
 }
 
+/* This in-memory fixture has dim=4, one layer, and only three vocabulary IDs.
+ * No model file or tokenizer is loaded; all matrix operations are tiny.
+ */
+static void test_cached_forward_matches_full_prefix_after_each_token(void)
+{
+    ForwardFixture fixture;
+    InferenceState reference = {};
+    InferenceState cached = {};
+    char error[ENGINE_ERROR_CAPACITY] = {};
+    const int token_ids[] = {0, 1, 2};
+    const int token_count = (int)(sizeof(token_ids) / sizeof(token_ids[0]));
+
+    initialize_fixture(&fixture);
+    assert(inference_state_init(&fixture.model, &reference, token_count,
+                                error, sizeof(error)) == 1);
+    assert(inference_state_init(&fixture.model, &cached, token_count,
+                                error, sizeof(error)) == 1);
+
+    for (int position = 0; position < token_count; ++position) {
+        /* Call the reference directly: the production callback may use caching. */
+        assert(qwen2_forward_token_reference(&fixture.model, &reference,
+                                             token_ids[position], error, sizeof(error)) == 1);
+        assert(qwen2_forward_token_cached(&fixture.model, &cached,
+                                          token_ids[position], error, sizeof(error)) == 1);
+        assert(reference.logits_count == FIXTURE_VOCAB_SIZE);
+        assert(cached.logits_count == FIXTURE_VOCAB_SIZE);
+
+        for (int id = 0; id < FIXTURE_VOCAB_SIZE; ++id) {
+            assert(floats_nearly_equal(cached.logits[id], reference.logits[id]));
+        }
+
+        const Qwen2InferenceState *reference_state =
+            (const Qwen2InferenceState *)reference.implementation;
+        const Qwen2InferenceState *cached_state =
+            (const Qwen2InferenceState *)cached.implementation;
+        assert(reference_state->token_count == position + 1);
+        assert(cached_state->token_count == position + 1);
+        assert(cached_state->token_ids[position] == token_ids[position]);
+    }
+
+    inference_state_destroy(&reference);
+    inference_state_destroy(&cached);
+}
+
 static void test_forward_rejects_invalid_token_and_exhausted_context(void)
 {
     ForwardFixture fixture;
@@ -291,6 +336,7 @@ int main(void)
 
     test_model_configuration_validates_output_norm();
     test_two_token_full_prefix_forward();
+    test_cached_forward_matches_full_prefix_after_each_token();
     test_forward_rejects_invalid_token_and_exhausted_context();
     test_attention_failure_reports_error_and_allows_retry();
 

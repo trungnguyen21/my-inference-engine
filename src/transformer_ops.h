@@ -44,6 +44,10 @@ int transformer_apply_rope_f32(
  * query, keys, or values. Return 1 on success and 0 for invalid arguments.
  * This function allocates no memory.
  */
+/* TODO(kv-cache/08): When callers use persistent K/V, update the temporary-array
+ * description above. The API/layout already accepts one layer's cache slice;
+ * token_count must be its active length, including the new token.
+ */
 int transformer_attention_f32(
     const float *query,
     int query_head_count,

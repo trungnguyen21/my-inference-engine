@@ -83,6 +83,29 @@ Metrics report generation elapsed time, throughput, process CPU percentage,
 and current resident RAM when supported by macOS or Linux. CPU percentage can
 exceed 100% when multiple cores are used.
 
+## Tests
+
+The automated suite contains unit tests and four small integration tests using
+synthetic tensors or scripted backends. It never loads a real model. Each test
+has a 30-second timeout.
+
+```sh
+./build.sh
+ctest --test-dir build --output-on-failure
+
+# Run either group independently.
+ctest --test-dir build -L '^unit$' --output-on-failure
+ctest --test-dir build -L '^integration$' --output-on-failure
+
+# Tiny cached-vs-full-prefix comparison: one layer, dim 4, three token IDs.
+cmake --build build --target forward_reference_test
+ctest --test-dir build -R '^forward_reference_test$' --output-on-failure
+```
+
+The real-model acceptance executables and CLI smoke test have been removed.
+Older milestone documents retain historical evidence of their results; use
+the commands above for the current automated suite.
+
 ### Operation timings
 
 Add `--profile` to collect and print an operation breakdown after generation:

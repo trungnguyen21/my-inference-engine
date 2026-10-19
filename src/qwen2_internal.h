@@ -1,6 +1,7 @@
 #ifndef QWEN2_INTERNAL_H
 #define QWEN2_INTERNAL_H
 
+#include "engine.h"
 #include "engine_internal.h"
 
 /*
@@ -11,6 +12,9 @@
  * qwen2_state_init allocates and initializes every pointer. The forward path
  * reuses these buffers; it must
  * not call malloc, calloc, realloc, or free per token.
+ *
+ * KV-cache exercise: follow docs/kv-cache-implementation-checklist.md and
+ * search for TODO(kv-cache/...). The active backend is still full-prefix.
  */
 typedef struct Qwen2InferenceState {
     EngineStateHeader header;
@@ -21,12 +25,19 @@ typedef struct Qwen2InferenceState {
 
     int *token_ids; /* max_context_tokens values; append one ID per forward call */
 
-    /* One activation vector per prefix position: [position][model dim]. */
+    /*
+     * One activation vector per prefix position: [model dim].
+     * Cached execution needs only model dim floats.
+     */
     float *activations;
 
-    /* Per-layer workspace rebuilt while evaluating the full prefix. */
-    float *keys;                    /* [position][KV head][head dimension] */
-    float *values;                  /* [position][KV head][head dimension] */
+    /*
+     * Expand with KV Cache:
+     * keys and values now store computed after Q, K, V projection and RoPE
+     * in this format: [layer][position][KV head][head dimension].
+     */
+    float *keys;                    /* [layer][position][KV head][head dimension] */
+    float *values;                  /* [layer][position][KV head][head dimension] */
     float *normalized;              /* model dim */
     float *query;                   /* n_heads * head_dimension */
     float *key;                     /* n_kv_heads * head_dimension */
@@ -37,6 +48,52 @@ typedef struct Qwen2InferenceState {
     float *ffn_up;                  /* hidden_dim */
     float *matvec_output;           /* maximum of model dim, hidden_dim, vocab */
 } Qwen2InferenceState;
+
+/*
+ * Borrowed pointers into one layer of the FUTURE persistent KV cache.
+ * keys/values start at position zero; key_slot/value_slot point at the
+ * position being appended. No member owns storage or needs to be freed.
+ */
+typedef struct Qwen2KvCacheLayerView {
+    float *keys;
+    float *values;
+    float *key_slot;
+    float *value_slot;
+    int token_count; /* active attention length, including the appended token */
+} Qwen2KvCacheLayerView;
+
+/*
+ * The qwen2_kv_cache_layer_view function initializes a view of the key-value cache for a specified
+ * layer and position in a model's inference state, ensuring that all parameters are valid and that
+ * the model and state dimensions are consistent. It populates the provided Qwen2KvCacheLayerView structure
+ * with pointers to the appropriate keys and values.
+*/
+int qwen2_kv_cache_layer_view(
+    const Model *model,
+    Qwen2InferenceState *private_state,
+    int layer,
+    int position,
+    Qwen2KvCacheLayerView *view,
+    char *error,
+    int error_capacity
+);
+
+/* Full-prefix reference for tests. Use a separate state from cached execution. */
+int qwen2_forward_token_reference(
+    const Model *model,
+    InferenceState *state,
+    int token_id,
+    char *error,
+    int error_capacity
+);
+
+int qwen2_forward_token_cached(
+    const Model *model,
+    InferenceState *state,
+    int token_id,
+    char *error,
+    int error_capacity
+);
 
 /*
  * Decode one row of a packed embedding matrix.

@@ -263,6 +263,27 @@ static int qwen2_state_init(
         return 0;
     }
 
+    // Number of floats needed for one layer.
+    size_t layer_stride = context * kv_dim;
+    size_t layers = (size_t)config.n_layers;
+
+    // Check the multiplication before performing it.
+    if (layers > SIZE_MAX / layer_stride) {
+        set_error(error, error_capacity,
+                "Qwen2 KV-cache element count overflows.");
+        return 0;
+    }
+
+    // Number of floats needed for all layers, in EACH cache.
+    size_t cache_count = layers * layer_stride;
+
+    // calloc also needs the total byte count to fit.
+    if (cache_count > SIZE_MAX / sizeof(float)) {
+        set_error(error, error_capacity,
+                "Qwen2 KV-cache byte size overflows.");
+        return 0;
+    }
+
     private_state = (Qwen2InferenceState *)calloc(1, sizeof(Qwen2InferenceState));
     if (private_state == nullptr) {
         set_error(error, error_capacity, "Could not allocate Qwen2 inference state.");
@@ -278,8 +299,8 @@ static int qwen2_state_init(
     if (private_state->field == nullptr) goto allocation_failure
     ALLOC_FIELD(token_ids, context, int);
     ALLOC_FIELD(activations, context * dim, float);
-    ALLOC_FIELD(keys, context * kv_dim, float);
-    ALLOC_FIELD(values, context * kv_dim, float);
+    ALLOC_FIELD(keys, cache_count, float);
+    ALLOC_FIELD(values, cache_count, float);
     ALLOC_FIELD(normalized, dim, float);
     ALLOC_FIELD(query, dim, float);
     ALLOC_FIELD(key, kv_dim, float);
@@ -632,7 +653,60 @@ static int qwen2_layer_project(
     return 1;
 }
 
-static int qwen2_forward_token(
+int qwen2_kv_cache_layer_view(
+    const Model *model,
+    Qwen2InferenceState *private_state,
+    int layer,
+    int position,
+    Qwen2KvCacheLayerView *view,
+    char *error,
+    int error_capacity
+)
+{
+    if (view != nullptr) memset(view, 0, sizeof(*view));
+
+    if (model == nullptr || private_state == nullptr || view == nullptr ||
+        private_state->keys == nullptr || private_state->values == nullptr) {
+        set_error(error, error_capacity, "Qwen2 KV-cache storage or view is not initialized.");
+        return 0;
+    }
+    const ModelConfig &config = model->config;
+    if (config.dim <= 0 || config.n_layers <= 0 || config.n_heads <= 0 ||
+        config.n_kv_heads <= 0 || config.n_kv_heads > config.n_heads ||
+        config.dim % config.n_heads != 0 || config.n_heads % config.n_kv_heads != 0 ||
+        private_state->max_context_tokens <= 0 ||
+        private_state->max_context_tokens > config.seq_len ||
+        private_state->head_dimension != config.dim / config.n_heads ||
+        private_state->key_value_dimension !=
+            (config.dim / config.n_heads) * config.n_kv_heads) {
+        set_error(error, error_capacity, "Qwen2 KV-cache model and state dimensions are inconsistent.");
+        return 0;
+    }
+    if (layer < 0 || layer >= config.n_layers ||
+        position < 0 || position >= private_state->max_context_tokens) {
+        set_error(error, error_capacity, "Qwen2 KV-cache layer or position is out of range.");
+        return 0;
+    }
+    if ((size_t)private_state->max_context_tokens >
+        SIZE_MAX / sizeof(float) / (size_t)private_state->key_value_dimension /
+            (size_t)config.n_layers) {
+        set_error(error, error_capacity, "Qwen2 KV-cache byte size overflows.");
+        return 0;
+    }
+    size_t layer_stride = (size_t)private_state->max_context_tokens * (size_t)private_state->key_value_dimension;
+    size_t layer_offset = (size_t)layer * layer_stride;
+    size_t token_offset = (size_t)private_state->key_value_dimension * (size_t)position;
+    view->keys = private_state->keys + layer_offset;
+    view->values = private_state->values + layer_offset;
+    view->key_slot = view->keys + token_offset;
+    view->value_slot = view->values + token_offset;
+    view->token_count = position + 1;
+    if (error != nullptr && error_capacity > 0) error[0] = '\0';
+    return 1;
+}
+
+
+int qwen2_forward_token_reference(
     const Model *model,
     InferenceState *state,
     int token_id,
@@ -668,7 +742,7 @@ static int qwen2_forward_token(
 
     for (int p = 0; p < prefix_length; p++) {
         fn_ret = qwen2_lookup_embedding(
-            file, private_state->token_ids[p], model->config.dim, 
+            file, private_state->token_ids[p], model->config.dim,
             private_state->activations + (size_t)p * model->config.dim,
             error, error_capacity
         );
@@ -756,7 +830,7 @@ static int qwen2_forward_token(
                 set_error(error, error_capacity, "Qwen2 RoPE rotation failed.");
                 return 0;
             }
-            
+
             // Store back to our state
             size_t size = (size_t)private_state->key_value_dimension * sizeof(float);
             size_t offset = (size_t)i * private_state->key_value_dimension;
@@ -802,14 +876,14 @@ static int qwen2_forward_token(
 
             // add to private_state->normalized (temporarily)
             fn_ret = tensor_add_f32(
-                private_state->matvec_output, act_vector_start, 
+                private_state->matvec_output, act_vector_start,
                 model->config.dim, private_state->normalized);
             if (!fn_ret) {
                 set_error(error, error_capacity, "Qwen2 attention residual addition failed.");
                 return 0;
             }
             memcpy(
-                act_vector_start, 
+                act_vector_start,
                 private_state->normalized,
                 (size_t)model->config.dim * sizeof(float)
             );
@@ -864,15 +938,15 @@ static int qwen2_forward_token(
             }
 
             fn_ret = transformer_swiglu_f32(
-                private_state->ffn_gate, 
-                private_state->ffn_up, 
+                private_state->ffn_gate,
+                private_state->ffn_up,
                 model->config.hidden_dim
             );
             if (!fn_ret) {
                 set_error(error, error_capacity, "Qwen2 SwiGLU failed.");
                 return 0;
             }
-            
+
             // matvec_output = Wdown * ffn_gate
             {
                 OperationTimer timer(profile->enabled, &profile->matvec_seconds);
@@ -964,12 +1038,343 @@ static int qwen2_forward_token(
     return 1;
 }
 
+int qwen2_forward_token_cached(
+    const Model *model,
+    InferenceState *state,
+    int token_id,
+    char *error,
+    int error_capacity
+)
+{
+    if (model == nullptr || state == nullptr || model->implementation == nullptr ||
+        state->implementation == nullptr || state->logits == nullptr) {
+        set_error(error, error_capacity, "Qwen2 model or inference state is not initialized.");
+        return 0;
+    }
+    if (token_id < 0 || token_id >= model->config.vocab_size) {
+        set_error(error, error_capacity, "Qwen2 input token ID is out of range.");
+        return 0;
+    }
+
+    Qwen2InferenceState *private_state = (Qwen2InferenceState *)state->implementation;
+    const EngineModel *implementation = (const EngineModel *)model->implementation;
+    const GgufFile *file = &implementation->gguf;
+    GgufF32TensorView view;
+    int fn_ret;
+
+    int position = private_state->token_count;
+    if (position >= private_state->max_context_tokens) {
+        set_error(error, error_capacity, "Qwen2 context capacity is exhausted.");
+        return 0;
+    }
+    OperationProfile *profile = &state->profile;
+    OperationTimer forward_timer(profile->enabled, &profile->forward_seconds);
+    int prefix_length = position + 1;
+
+    fn_ret = qwen2_lookup_embedding(
+        file, token_id, model->config.dim,
+        private_state->activations,
+        error, error_capacity
+    );
+    if (!fn_ret) {
+        return 0;
+    }
+
+    // Calculate causal attention
+    for (int layer = 0; layer < model->config.n_layers; layer++) {
+        float *act_vector_start = private_state->activations;
+        fn_ret = qwen2_get_layer_vector(
+            file, layer, "attn_norm.weight", model->config.dim,
+            &view, error, error_capacity
+        );
+        if (!fn_ret) {
+            return 0;
+        }
+        {
+            OperationTimer timer(profile->enabled, &profile->rmsnorm_seconds);
+            fn_ret = tensor_rms_norm_f32(
+                act_vector_start, view.data,
+                model->config.dim, model->config.rms_norm_epsilon,
+                private_state->normalized
+            );
+        }
+        if (!fn_ret) {
+            set_error(error, error_capacity, "Qwen2 attention RMSNorm failed.");
+            return 0;
+        }
+
+        // Project the query vector, then add its bias.
+        {
+            OperationTimer timer(profile->enabled, &profile->matvec_seconds);
+            fn_ret = qwen2_layer_project(
+                file, layer, "attn_q",
+                private_state->normalized, model->config.dim,
+                private_state->query, model->config.dim,
+                private_state->matvec_output, error, error_capacity
+            );
+        }
+        if (!fn_ret) {
+            return 0;
+        }
+        // Project the key vector, then add its bias.
+        {
+            OperationTimer timer(profile->enabled, &profile->matvec_seconds);
+            fn_ret = qwen2_layer_project(
+                file, layer, "attn_k",
+                private_state->normalized, model->config.dim,
+                private_state->key, private_state->key_value_dimension,
+                private_state->matvec_output, error, error_capacity
+            );
+        }
+        if (!fn_ret) {
+            return 0;
+        }
+        // Project the value vector, then add its bias.
+        {
+            OperationTimer timer(profile->enabled, &profile->matvec_seconds);
+            fn_ret = qwen2_layer_project(
+                file, layer, "attn_v",
+                private_state->normalized, model->config.dim,
+                private_state->value, private_state->key_value_dimension,
+                private_state->matvec_output, error, error_capacity
+            );
+        }
+        if (!fn_ret) {
+            return 0;
+        }
+        // Applying RoPE
+        {
+            OperationTimer timer(profile->enabled, &profile->rope_seconds);
+            fn_ret = transformer_apply_rope_f32(
+                private_state->query, model->config.n_heads,
+                private_state->key,
+                model->config.n_kv_heads,
+                private_state->head_dimension,
+                private_state->head_dimension,
+                position, model->config.rope_frequency_base
+            );
+        }
+        if (!fn_ret) {
+            set_error(error, error_capacity, "Qwen2 RoPE rotation failed.");
+            return 0;
+        }
+
+        // Store back to our state
+        Qwen2KvCacheLayerView cache_view;
+        if (!qwen2_kv_cache_layer_view(
+                model, private_state, layer, position, &cache_view,
+                error, error_capacity)) {
+            return 0;
+        }
+        size_t size = (size_t)private_state->key_value_dimension * sizeof(float);
+        memcpy(cache_view.key_slot, private_state->key, size);
+        memcpy(cache_view.value_slot, private_state->value, size);
+
+        // apply attention
+        {
+            OperationTimer timer(profile->enabled, &profile->attention_seconds);
+            fn_ret = transformer_attention_f32(
+                private_state->query,
+                model->config.n_heads,
+                model->config.n_kv_heads,
+                private_state->head_dimension,
+                cache_view.keys,
+                cache_view.values,
+                cache_view.token_count,
+                private_state->attention_probabilities,
+                private_state->attention_output
+            );
+        }
+        if (!fn_ret) {
+            set_error(error, error_capacity, "Qwen2 grouped-query attention failed.");
+            return 0;
+        }
+
+        // Updating token activation
+        {
+            OperationTimer timer(profile->enabled, &profile->matvec_seconds);
+            fn_ret = qwen2_layer_matvec(
+                file, layer, "attn_output.weight",
+                private_state->attention_output, model->config.dim,
+                private_state->matvec_output, model->config.dim,
+                error, error_capacity
+            );
+        }
+        if (!fn_ret) {
+            return 0;
+        }
+
+        // add to private_state->normalized (temporarily)
+        fn_ret = tensor_add_f32(
+            private_state->matvec_output, act_vector_start,
+            model->config.dim, private_state->normalized);
+        if (!fn_ret) {
+            set_error(error, error_capacity, "Qwen2 attention residual addition failed.");
+            return 0;
+        }
+        memcpy(
+            act_vector_start,
+            private_state->normalized,
+            (size_t)model->config.dim * sizeof(float)
+        );
+
+        // Feed-forward network
+        fn_ret = qwen2_get_layer_vector(
+            file, layer, "ffn_norm.weight", model->config.dim,
+            &view, error, error_capacity
+        );
+        if (!fn_ret) {
+            return 0;
+        }
+        {
+            OperationTimer timer(profile->enabled, &profile->rmsnorm_seconds);
+            fn_ret = tensor_rms_norm_f32(
+                act_vector_start,
+                view.data,
+                model->config.dim,
+                model->config.rms_norm_epsilon,
+                private_state->normalized
+            );
+        }
+        if (!fn_ret) {
+            set_error(error, error_capacity, "Qwen2 FFN RMSNorm failed.");
+            return 0;
+        }
+
+        {
+            OperationTimer timer(profile->enabled, &profile->matvec_seconds);
+            fn_ret = qwen2_layer_matvec(
+                file, layer, "ffn_gate.weight",
+                private_state->normalized, model->config.dim,
+                private_state->ffn_gate, model->config.hidden_dim,
+                error, error_capacity
+            );
+        }
+        if (!fn_ret) {
+            return 0;
+        }
+
+        {
+            OperationTimer timer(profile->enabled, &profile->matvec_seconds);
+            fn_ret = qwen2_layer_matvec(
+                file, layer, "ffn_up.weight",
+                private_state->normalized, model->config.dim,
+                private_state->ffn_up, model->config.hidden_dim,
+                error, error_capacity
+            );
+        }
+        if (!fn_ret) {
+            return 0;
+        }
+
+        fn_ret = transformer_swiglu_f32(
+            private_state->ffn_gate,
+            private_state->ffn_up,
+            model->config.hidden_dim
+        );
+        if (!fn_ret) {
+            set_error(error, error_capacity, "Qwen2 SwiGLU failed.");
+            return 0;
+        }
+
+        // matvec_output = Wdown * ffn_gate
+        {
+            OperationTimer timer(profile->enabled, &profile->matvec_seconds);
+            fn_ret = qwen2_layer_matvec(
+                file, layer, "ffn_down.weight",
+                private_state->ffn_gate, model->config.hidden_dim,
+                private_state->matvec_output, model->config.dim,
+                error, error_capacity
+            );
+        }
+        if (!fn_ret) {
+            return 0;
+        }
+
+        // x + matvec_output → temporary buffer
+        fn_ret = tensor_add_f32(
+            act_vector_start,
+            private_state->matvec_output,
+            model->config.dim,
+            private_state->normalized
+        );
+        if (!fn_ret) {
+            set_error(error, error_capacity, "Qwen2 FFN residual addition failed.");
+            return 0;
+        }
+
+        // Store the completed sum back into x.
+        memcpy(
+            act_vector_start,
+            private_state->normalized,
+            (size_t)model->config.dim * sizeof(float)
+        );
+
+    }
+
+    // Only the LAST position supplies next-token logits.
+    //normalized = rms_norm(activations[last], output_norm_weight);
+    if (!gguf_get_f32_tensor_view(file, "output_norm.weight", &view) ||
+        view.dimension_count != 1 ||
+        view.dimensions[0] != (uint64_t)model->config.dim) {
+        set_error(error, error_capacity, "Invalid output_norm.weight.");
+        return 0;
+    }
+
+    {
+        OperationTimer timer(profile->enabled, &profile->rmsnorm_seconds);
+        fn_ret = tensor_rms_norm_f32(
+            private_state->activations, view.data,
+            model->config.dim, model->config.rms_norm_epsilon,
+            private_state->normalized
+        );
+    }
+    if (!fn_ret) {
+        set_error(error, error_capacity, "Final RMSNorm failed.");
+        return 0;
+    }
+
+
+    {
+        OperationTimer timer(profile->enabled, &profile->output_seconds);
+        fn_ret = qwen2_weight_matvec(
+            file, "output.weight",
+            private_state->normalized, model->config.dim,
+            state->logits, model->config.vocab_size,
+            error, error_capacity
+        );
+    }
+    if (!fn_ret) {
+        return 0;
+    }
+
+    // Check every logit is finite before committing success.
+    for (int j = 0; j < model->config.vocab_size; ++j) {
+        if (!isfinite(state->logits[j])) {
+            set_error(error, error_capacity, "Output contains a non-finite logit.");
+            return 0;
+        }
+    }
+
+    if (profile->enabled) ++profile->forward_calls;
+    state->logits_count = model->config.vocab_size;
+    private_state->token_ids[position] = token_id;
+    private_state->token_count = prefix_length;
+    if (error != nullptr && error_capacity > 0) error[0] = '\0';
+    return 1;
+}
+
 static void qwen2_state_destroy(InferenceState *state)
 {
     Qwen2InferenceState *private_state;
     if (state == nullptr) return;
     private_state = (Qwen2InferenceState *)state->implementation;
     if (private_state != nullptr) {
+        /* TODO(kv-cache/02): Keep cleanup safe after partial initialization.
+         * Expanded contiguous keys/values still need one free each. Borrowed
+         * layer-view pointers must never be freed. Clean up any separate
+         * reference workspace if introduced.
+         */
         free(private_state->token_ids);
         free(private_state->activations);
         free(private_state->keys);
@@ -1031,7 +1436,7 @@ const ArchitectureOps *qwen2_architecture_ops(void)
         qwen2_configure_model,
         qwen2_destroy_model_data,
         qwen2_state_init,
-        qwen2_forward_token,
+        qwen2_forward_token_cached,
         qwen2_state_destroy,
         qwen2_format_prompt
     };

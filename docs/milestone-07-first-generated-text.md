@@ -167,27 +167,19 @@ fixture, not actual model generation.
 
 Follow the final commands in the
 [roadmap to generated text](roadmap-to-generated-text.md#final-acceptance).
-The opt-in `real_text_generation_check` invokes the built CLI with the local
-GGUF, a short question, a 16-token limit, and temperature zero. It rejects a
-failed exit, missing/whitespace-only output, leaked ChatML/end markers, missing
-completion/metrics, or a token count outside the limit. It has no speed gate
-and does not require an exact answer string.
+The former real-model CLI smoke test has been removed from the automated suite.
+Real generation is now an optional manual exercise; it can take substantial
+time. Automated generation-loop coverage uses the fast scripted backend.
 
 ```sh
-cmake -S . -B build -DENGINE_TEST_MODEL_PATH=models/qwen-2.5.gguf
-cmake --build build --parallel
-ctest --test-dir build -R '^real_text_generation_check$' --output-on-failure
+ctest --test-dir build -R '^app_generation_contract_test$' --output-on-failure
 ```
 
-Read the response as well as running the smoke test. Finite logits and visible
+When manually running the real CLI, read the response. Finite logits and visible
 characters alone cannot establish model correctness. A coherent answer to
 the question plus the numerical forward fixtures provides stronger evidence.
 
-To return to the model-free test configuration, run:
-
-```sh
-cmake -S . -B build -DENGINE_TEST_MODEL_PATH=
-```
+Every automated test configuration is model-free; no local model path is needed.
 
 ## Definition of done
 
@@ -195,7 +187,7 @@ cmake -S . -B build -DENGINE_TEST_MODEL_PATH=
 - [x] Pass greedy selection and the public sampler routing tests.
 - [x] Pass exact single-user prompt formatting and architecture dispatch tests.
 - [x] Prepare and pass deterministic app sequencing, EOS, limit, and error tests.
-- [x] Pass all 23 registered checks with `ENGINE_TEST_MODEL_PATH` configured.
+- [x] Historically pass all 23 checks, including real-model acceptance (2026-10-16).
 - [x] See readable, relevant output from the real CLI with temperature zero.
 - [x] Check a one-token limit, a second prompt, and an invalid path with the CLI.
 

@@ -1,4 +1,4 @@
-# Inference Optimization Roadmap
+'''''''''''''# Inference Optimization Roadmap
 
 Prepared for review on 2026-10-16, after the first successful real-model text
 generation. These are proposed changes, ranked from small local edits to major

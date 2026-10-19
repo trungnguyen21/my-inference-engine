@@ -130,24 +130,22 @@ two successive tokens and proves each call recomputes the complete prefix.
 
 **Checkpoint:** packed embedding rows and matrix-vector projections now pass
 both focused tests and the mixed-weight forward comparison. The commands below
-also enable the real-model schema, lifecycle, and output checks.
+run synthetic unit and integration checks. Historical real-model acceptance
+checks have been removed from the build and test suite.
 
 ## Commands
 
 ```sh
 ./build.sh
 
-# Default configuration: 20 passes; 3 model checks need a local model path.
+# All automated checks use synthetic fixtures or scripted backends.
 ctest --test-dir build --output-on-failure
 
 # Run the three packed-forward regressions independently.
 ctest --test-dir build -L milestone06-quantized --output-on-failure
 
-# Enable local-model checks, then run through Milestone 06 only.
-cmake -S . -B build -DENGINE_TEST_MODEL_PATH=models/qwen-2.5.gguf
-cmake --build build --parallel
-
-ctest --test-dir build -LE milestone07 --output-on-failure
+# Run the small cross-component checks separately.
+ctest --test-dir build -L '^integration$' --output-on-failure
 ```
 
 The [Milestone 07 guide](milestone-07-first-generated-text.md) describes

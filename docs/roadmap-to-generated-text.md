@@ -25,11 +25,11 @@ before tokenization and the forward pass.
 | --- | --- | --- |
 | 06A | `qwen2_decode_quantized_embedding_row` in `src/qwen2_architecture.cpp` | `qwen2_embedding_reference_test` |
 | 06B | Packed branch of `qwen2_weight_matvec` in the same file | `qwen2_matvec_reference_test` |
-| 06C | Verify packed and F32 logits agree | `forward_quantized_reference_test`, `real_model_forward_check` |
+| 06C | Verify packed/F32 logits and cached/reference execution agree | `forward_quantized_reference_test`, `forward_reference_test` |
 | 07A | `sampler_greedy_sample` in `src/sampler.cpp` | `sampler_greedy_test` |
 | 07B | `qwen2_format_prompt` in `src/qwen2_architecture.cpp` | `prompt_format_reference_test` |
 | 07C | Existing app loop with tested sequencing and cleanup | `app_generation_contract_test` passes with a scripted backend |
-| 07D | Run the executable with the actual GGUF; inspect the response | `real_text_generation_check` plus a manual reading check |
+| 07D | Run the executable with the actual GGUF; inspect the response | Historical manual acceptance; outside the automated suite |
 
 Start with [Milestone 06: quantized integration](milestone-06-quantized-forward.md).
 Then follow [Milestone 07: first generated text](milestone-07-first-generated-text.md).
@@ -37,17 +37,21 @@ Those guides specify inputs, outputs, validation, tests, and completion criteria
 
 ## Current test status
 
-The full build succeeds. With no `ENGINE_TEST_MODEL_PATH` configured, CTest has
-23 checks: all 20 model-free checks pass and 3 real-model checks are disabled.
-The packed embedding and projection checks also pass AddressSanitizer and
-UndefinedBehaviorSanitizer. All 23 checks passed with the local model enabled
-on 2026-10-16. All checkpoints are ordinary regression tests.
+CTest contains 18 unit tests and four small integration tests. All use synthetic
+fixtures or scripted backends; real-model acceptance checks and build targets
+have been removed. `forward_reference_test` includes a three-token comparison
+of cached and full-prefix execution using a four-dimensional model.
+
+The older real-model results below are historical evidence from 2026-10-16.
 
 ```sh
 ./build.sh
 
-# All model-free checks.
-ctest --test-dir build -E '^real_' --output-on-failure
+# All automated checks, with no real-model loading.
+ctest --test-dir build --output-on-failure
+
+ctest --test-dir build -L '^unit$' --output-on-failure
+ctest --test-dir build -L '^integration$' --output-on-failure
 
 # Focused packed-forward and sampler/prompt regressions.
 ctest --test-dir build -L milestone06-quantized --output-on-failure
@@ -55,8 +59,7 @@ ctest --test-dir build -L milestone07-exercises --output-on-failure
 ```
 
 The app contract tests use synthetic token pieces to check sequencing and
-errors independently of model math. The real forward check uses actual weights;
-the real CLI check adds instruction formatting, greedy selection, and output.
+errors. Forward integration tests use tiny in-memory models to check model math.
 
 ## Verified first output (2026-10-16)
 
@@ -77,10 +80,11 @@ elapsed time starts after prefill, so it does not measure that initial wait.
 
 ## Final acceptance
 
-Run the implementation with all real-model checks enabled:
+Run the automated suite. The CLI invocation is a separate, optional manual
+exercise and may be slow:
 
 ```sh
-cmake -S . -B build -DENGINE_TEST_MODEL_PATH=models/qwen-2.5.gguf
+cmake -S . -B build
 cmake --build build --parallel
 ctest --test-dir build --output-on-failure
 
@@ -90,11 +94,10 @@ ctest --test-dir build --output-on-failure
   --max-tokens 16 --temperature 0 --top-p 1
 ```
 
-All 23 tests pass with the local model configured. When changing the implementation, read the response:
+When manually exercising the implementation, read the response:
 it should be relevant, readable, and free of role markers. For this question,
-it should identify Paris. The automated CLI check requires visible output,
-clean completion, a bounded token count, and metrics; it does not judge
-semantic quality or require an exact sentence.
+it should identify Paris. Automated coverage of sequencing, EOS, limits, errors,
+and cleanup uses the scripted app backend, without real model generation.
 
 Repeat manually with `--max-tokens 1` to check the limit, a second short prompt
 to check relevance, and an invalid model path to check a useful error. EOS

@@ -29,8 +29,8 @@ including the embedding, matrix dispatch, and mixed-weight logits comparisons.
 The packed helper tests also pass AddressSanitizer and UndefinedBehaviorSanitizer.
 The local schema and real forward checks pass, including 151,936 finite logits
 and context/lifecycle error cases. The CLI produces `Hello` for `Say hello.`
-with a one-token limit. Real-model CTest checks are opt-in through
-`ENGINE_TEST_MODEL_PATH`. See the [roadmap](milestone-06-roadmap.md) and
+with a one-token limit. Those real-model results are historical; automated tests
+now use only synthetic fixtures and scripted backends. See the [roadmap](milestone-06-roadmap.md) and
 [quantized integration contracts](milestone-06-quantized-forward.md).
 
 ## Architecture boundary
@@ -199,20 +199,17 @@ remain the public orchestration boundary in `include/engine.h`.
 
 Every Milestone 06 test is registered with CTest as soon as its source exists.
 Enabled checks fail normally for incomplete or incorrect implementation; none
-are marked as expected failures. The two Milestone 06 real-model checks are registered as
-disabled unless CMake receives `ENGINE_TEST_MODEL_PATH`. Their disabled status
-does not establish that real-model inference works.
+are marked as expected failures. The former real-model checks and their build
+targets have been removed to keep automated testing fast and model-free.
 
 | Check | Evidence it provides | Command when its implementation is ready |
 | --- | --- | --- |
 | `transformer_ops_reference_test` | numerical RoPE, grouped-query attention, SwiGLU, and invalid-argument behavior | `ctest --test-dir build -R transformer_ops_reference_test --output-on-failure` |
-| `real_model_schema_check` | model loader retains RMSNorm/RoPE metadata from the local Qwen GGUF | `./build/real_model_schema_check models/qwen-2.5.gguf` |
 | `inference_state_contract_test` | state allocation, public logits, private workspace layout, invalid requests, and destruction | `ctest --test-dir build -R inference_state_contract_test --output-on-failure` |
-| `forward_reference_test` | exact known logits across successive full-prefix recomputations for a one-layer Qwen-shaped fixture | `ctest --test-dir build -R forward_reference_test --output-on-failure` |
+| `forward_reference_test` | exact known logits and cached-vs-full-prefix logits across three tokens in a tiny one-layer fixture | `ctest --test-dir build -R forward_reference_test --output-on-failure` |
 | `qwen2_embedding_reference_test` | selected packed rows for all four formats, block strides, unaligned bytes, boundaries, and invalid views | `ctest --test-dir build -R '^qwen2_embedding_reference_test$' --output-on-failure` |
 | `qwen2_matvec_reference_test` | F32/packed dispatch, rectangular weights, layer/global names, malformed storage, and invalid arguments | `ctest --test-dir build -R '^qwen2_matvec_reference_test$' --output-on-failure` |
 | `forward_quantized_reference_test` | mixed packed/F32 forward versus a dense oracle, failed-forward retry, context, and cleanup | `ctest --test-dir build -R '^forward_quantized_reference_test$' --output-on-failure` |
-| `real_model_forward_check` | actual Qwen tokenization, prefill, F32 logits buffer shape, and finite output | configure `ENGINE_TEST_MODEL_PATH`, then run `ctest --test-dir build -R real_model_forward_check --output-on-failure` |
 | Full suite | regression protection for milestones 04 and 05 | `ctest --test-dir build --output-on-failure` |
 
 The F32 fixture must include a nonzero Q/K/V path, two positions, grouped query

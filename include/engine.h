@@ -74,6 +74,9 @@ int tokenizer_is_eos(const Model *model, int token_id);
  * inference_state_destroy after either result. No token-forward function may
  * allocate memory after this initialization succeeds.
  */
+/* TODO(kv-cache/08): When cached execution becomes active, update the contract
+ * above to describe persistent all-layer K/V and the chosen activation storage.
+ */
 int inference_state_init(const Model *model, InferenceState *state,
                          int max_context_tokens,
                          char *error, int error_capacity);
@@ -94,6 +97,9 @@ int inference_state_init(const Model *model, InferenceState *state,
  * Return 1 only after all of those outputs are valid. Return 0 with an error
  * for invalid arguments, exhausted context, malformed model tensor data, or a
  * failed tensor operation. A failed call must not advance the state position.
+ */
+/* TODO(kv-cache/08): At the callback switch, describe incremental execution
+ * above while preserving finite-logit, capacity, and failure/commit guarantees.
  */
 int engine_forward_token(const Model *model, InferenceState *state,
                          int token_id, char *error, int error_capacity);
