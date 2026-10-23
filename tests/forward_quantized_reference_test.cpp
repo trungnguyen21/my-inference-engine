@@ -191,6 +191,19 @@ int main(int argc, char **argv)
         assert(profiled.profile.rope_seconds > 0.0);
         assert(profiled.profile.output_seconds > 0.0);
         assert(profiled.profile.sampling_seconds == 0.0);
+        unsigned long long calls = (unsigned long long)token + 1;
+        if (packed_parts & PACK_LAYERS) {
+            assert(profiled.profile.weight_layer_calls[PROFILE_Q5_0] == 2 * calls);
+            assert(profiled.profile.weight_layer_calls[PROFILE_Q4_K] == 2 * calls);
+            assert(profiled.profile.weight_layer_calls[PROFILE_Q6_K] == 2 * calls);
+            assert(profiled.profile.weight_layer_calls[PROFILE_Q8_0] == calls);
+            assert(profiled.profile.weight_layer_seconds[PROFILE_Q5_0] > 0.0);
+        } else {
+            assert(profiled.profile.weight_layer_calls[PROFILE_F32] == 7 * calls);
+        }
+        int output_format = (packed_parts & PACK_OUTPUT) ? PROFILE_Q8_0 : PROFILE_F32;
+        assert(profiled.profile.weight_output_calls[output_format] == calls);
+        assert(profiled.profile.weight_output_seconds[output_format] > 0.0);
         double stages = profiled.profile.matvec_seconds + profiled.profile.attention_seconds +
                         profiled.profile.rmsnorm_seconds + profiled.profile.rope_seconds +
                         profiled.profile.output_seconds;

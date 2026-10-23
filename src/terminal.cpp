@@ -25,12 +25,19 @@ void terminal_print_generated_text(const char *text)
 }
 
 void terminal_finish_generation(int generated_tokens, double elapsed_seconds,
+                                double time_to_first_token_seconds,
                                 const UsageSnapshot *start,
                                 const UsageSnapshot *end)
 {
     double cpu_percent = metrics_cpu_percent(start, end);
     printf("\n\n\033[1;36mGeneration complete\033[0m\n");
     printf("Generated tokens: %d\n", generated_tokens);
+    if (time_to_first_token_seconds >= 0.0) {
+        printf("Time to first token: %.3f s (excludes model loading)\n",
+               time_to_first_token_seconds);
+    } else {
+        printf("Time to first token: unavailable\n");
+    }
     printf("Elapsed time: %.3f s\n", elapsed_seconds);
     printf("Throughput: %.2f tokens/s\n",
            metrics_tokens_per_second(generated_tokens, elapsed_seconds));
@@ -82,5 +89,26 @@ void terminal_print_operation_profile(const OperationProfile *profile)
                total > 0.0 ? seconds[i] / total * 100.0 : 0.0);
     }
     printf("%-30s %12.3f\n", "Total profiled time", total * 1000.0);
+
+    const char *formats[PROFILE_WEIGHT_FORMAT_COUNT] = {
+        "F32", "Q5_0", "Q8_0", "Q4_K", "Q6_K"
+    };
+    double weight_total = 0.0;
+    for (int i = 0; i < PROFILE_WEIGHT_FORMAT_COUNT; ++i) {
+        weight_total += profile->weight_layer_seconds[i] + profile->weight_output_seconds[i];
+    }
+    printf("\nWeight kernels by format (prefill + decode)\n");
+    printf("%-8s %11s %11s %9s %9s %8s\n",
+           "Format", "Layer ms", "Output ms", "Total ms", "Calls", "Share");
+    for (int i = 0; i < PROFILE_WEIGHT_FORMAT_COUNT; ++i) {
+        double layer = profile->weight_layer_seconds[i];
+        double output = profile->weight_output_seconds[i];
+        printf("%-8s %11.3f %11.3f %9.3f %9llu %7.2f%%\n",
+               formats[i], layer * 1000.0, output * 1000.0,
+               (layer + output) * 1000.0,
+               profile->weight_layer_calls[i] + profile->weight_output_calls[i],
+               weight_total > 0.0 ? (layer + output) / weight_total * 100.0 : 0.0);
+    }
+    printf("Kernel-only times are subsets of the stage rows above (not additive).\n");
     printf("Excludes model loading, tokenization, and terminal output.\n");
 }

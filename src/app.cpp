@@ -149,6 +149,8 @@ int app_run(const AppConfig *config)
     int token_capacity = PROMPT_TOKEN_CAPACITY;
     int prompt_token_count = 0;
     int generated_tokens = 0;
+    int first_token_recorded = 0;
+    double time_to_first_token_seconds = -1.0;
     int requested_context;
     int model_loaded = 0;
     int state_initialized = 0;
@@ -156,6 +158,7 @@ int app_run(const AppConfig *config)
     int i;
     UsageSnapshot start_usage;
     UsageSnapshot end_usage;
+    UsageSnapshot prompt_start_usage;
 
     memset(&model, 0, sizeof(model));
     memset(&state, 0, sizeof(state));
@@ -175,6 +178,8 @@ int app_run(const AppConfig *config)
         goto cleanup;
     }
 
+    /* First-token latency includes prompt processing, starting with a ready model. */
+    metrics_capture(&prompt_start_usage);
     if (!engine_format_prompt(&model, config->prompt, formatted_prompt,
                               sizeof(formatted_prompt), error, sizeof(error))) {
         terminal_print_error(error);
@@ -267,6 +272,16 @@ int app_run(const AppConfig *config)
             goto cleanup;
         }
         terminal_print_generated_text(token_text);
+        if (!first_token_recorded && token_text[0] != '\0') {
+            UsageSnapshot first_token_usage;
+            metrics_capture(&first_token_usage);
+            first_token_recorded = 1;
+            if (prompt_start_usage.available && first_token_usage.available &&
+                first_token_usage.wall_seconds >= prompt_start_usage.wall_seconds) {
+                time_to_first_token_seconds =
+                    metrics_elapsed_seconds(&prompt_start_usage, &first_token_usage);
+            }
+        }
 
         /* Use sampled logits directly on the last step; otherwise decode once. */
         if (generated_tokens < config->max_tokens &&
@@ -279,6 +294,7 @@ int app_run(const AppConfig *config)
     metrics_capture(&end_usage);
     terminal_finish_generation(generated_tokens,
                                metrics_elapsed_seconds(&start_usage, &end_usage),
+                               time_to_first_token_seconds,
                                &start_usage, &end_usage);
     if (config->profile) terminal_print_operation_profile(&state.profile);
     exit_code = 0;

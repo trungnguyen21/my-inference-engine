@@ -44,6 +44,24 @@ static void test_f16_bits_to_f32(void)
 
     assert(f16_bits_to_f32(0x0001u, &result) == 1);
     assert(fabsf(result - 0.000000059604645f) <= 0.000000000001f);
+
+    /* All 65,536 encodings: compare finite values bit-for-bit to an
+     * independent arithmetic reference, including subnormals and -0. */
+    for (unsigned raw = 0; raw <= 0xffffu; ++raw) {
+        unsigned exponent = (raw >> 10) & 0x1fu;
+        unsigned fraction = raw & 0x3ffu;
+        assert(f16_bits_to_f32((uint16_t)raw, &result) == 1);
+        if (exponent == 31) {
+            if (fraction) assert(isnan(result));
+            else assert(isinf(result) && (!!signbit(result) == !!(raw & 0x8000u)));
+            continue;
+        }
+        float expected = exponent == 0
+            ? ldexpf((float)fraction, -24)
+            : ldexpf((float)(1024u + fraction), (int)exponent - 25);
+        if (raw & 0x8000u) expected = -expected;
+        assert(memcmp(&result, &expected, sizeof(float)) == 0);
+    }
 }
 
 static void test_q8_0_dequantize_block(void)

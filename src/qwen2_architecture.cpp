@@ -14,6 +14,51 @@
 #include <stdlib.h>
 #include <string.h>
 
+/* The public weight helper has no state parameter. Scope its optional profiling
+ * context to one forward call; thread_local keeps concurrent requests separate. */
+static thread_local OperationProfile *active_weight_profile = nullptr;
+
+class WeightProfileScope {
+public:
+    explicit WeightProfileScope(OperationProfile *profile)
+        : previous_(active_weight_profile)
+    {
+        active_weight_profile = profile->enabled ? profile : nullptr;
+    }
+    ~WeightProfileScope() { active_weight_profile = previous_; }
+    WeightProfileScope(const WeightProfileScope &) = delete;
+    WeightProfileScope &operator=(const WeightProfileScope &) = delete;
+private:
+    OperationProfile *previous_;
+};
+
+static int weight_format_index(uint32_t type)
+{
+    switch (type) {
+        case ENGINE_GGML_TYPE_F32: return PROFILE_F32;
+        case ENGINE_GGML_TYPE_Q5_0: return PROFILE_Q5_0;
+        case ENGINE_GGML_TYPE_Q8_0: return PROFILE_Q8_0;
+        case ENGINE_GGML_TYPE_Q4_K: return PROFILE_Q4_K;
+        case ENGINE_GGML_TYPE_Q6_K: return PROFILE_Q6_K;
+        default: return -1;
+    }
+}
+
+static void weight_profile_targets(uint32_t type, const char *name,
+                                   double **seconds, unsigned long long **calls)
+{
+    *seconds = nullptr;
+    *calls = nullptr;
+    if (active_weight_profile == nullptr) return;
+    int index = weight_format_index(type);
+    if (index < 0) return;
+    bool output = strcmp(name, "output.weight") == 0;
+    *seconds = output ? &active_weight_profile->weight_output_seconds[index]
+                      : &active_weight_profile->weight_layer_seconds[index];
+    *calls = output ? &active_weight_profile->weight_output_calls[index]
+                    : &active_weight_profile->weight_layer_calls[index];
+}
+
 static void set_error(char *error, int capacity, const char *message)
 {
     if (error != nullptr && capacity > 0) {
@@ -551,7 +596,21 @@ int qwen2_weight_matvec(
             }
             return 0;
         }
-        if (!quantized_tensor_matvec_f32(&packed, input, input_count, output, output_count)) {
+        int succeeded;
+        if (active_weight_profile == nullptr) {
+            // No clock reads or per-format bookkeeping on the unprofiled path.
+            succeeded = quantized_tensor_matvec_f32(&packed, input, input_count, output, output_count);
+        } else {
+            double *seconds;
+            unsigned long long *calls;
+            weight_profile_targets(tensor->type, name, &seconds, &calls);
+            {
+                OperationTimer timer(seconds != nullptr, seconds);
+                succeeded = quantized_tensor_matvec_f32(&packed, input, input_count, output, output_count);
+            }
+            if (succeeded && calls != nullptr) ++*calls;
+        }
+        if (!succeeded) {
             if (error != nullptr && error_capacity > 0) {
                 snprintf(error, (size_t)error_capacity,
                          "Qwen2 packed matrix-vector multiplication failed for %s.", name);
@@ -569,7 +628,20 @@ int qwen2_weight_matvec(
         }
         return 0;
     }
-    if (!tensor_matvec_f32(view.data, output_count, input_count, input, output)) {
+    int succeeded;
+    if (active_weight_profile == nullptr) {
+        succeeded = tensor_matvec_f32(view.data, output_count, input_count, input, output);
+    } else {
+        double *seconds;
+        unsigned long long *calls;
+        weight_profile_targets(tensor->type, name, &seconds, &calls);
+        {
+            OperationTimer timer(seconds != nullptr, seconds);
+            succeeded = tensor_matvec_f32(view.data, output_count, input_count, input, output);
+        }
+        if (succeeded && calls != nullptr) ++*calls;
+    }
+    if (!succeeded) {
         if (error != nullptr && error_capacity > 0) {
             snprintf(error, (size_t)error_capacity,
                      "Qwen2 matrix-vector multiplication failed for %s.", name);
@@ -737,6 +809,7 @@ int qwen2_forward_token_reference(
     }
     OperationProfile *profile = &state->profile;
     OperationTimer forward_timer(profile->enabled, &profile->forward_seconds);
+    WeightProfileScope weight_profile_scope(profile);
     private_state->token_ids[position] = token_id;
     int prefix_length = position + 1;
 
@@ -1069,6 +1142,7 @@ int qwen2_forward_token_cached(
     }
     OperationProfile *profile = &state->profile;
     OperationTimer forward_timer(profile->enabled, &profile->forward_seconds);
+    WeightProfileScope weight_profile_scope(profile);
     int prefix_length = position + 1;
 
     fn_ret = qwen2_lookup_embedding(
@@ -1080,7 +1154,7 @@ int qwen2_forward_token_cached(
         return 0;
     }
 
-    // Calculate causal attention
+    // Calculate multi-head attention with Grouped-Query Attention (GQA)
     for (int layer = 0; layer < model->config.n_layers; layer++) {
         float *act_vector_start = private_state->activations;
         fn_ret = qwen2_get_layer_vector(

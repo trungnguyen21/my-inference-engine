@@ -1,35 +1,47 @@
 #include <math.h>
+#include <string.h>
 #include "quantization.h"
 
 int f16_bits_to_f32(uint16_t bits, float *result)
 {
-    if (result == nullptr) {
-        return 0;
-    }
+    if (result == nullptr) return 0;
 
-    uint16_t sign = (bits >> 15) & 1;
-    uint16_t exponent = (bits >> 10) & 0x1f;
-    uint16_t fraction = bits & 0x03ff;
-
-    if (exponent == 31) {
+#if defined(__aarch64__) && defined(__ARM_FEATURE_FP16_SCALAR_ARITHMETIC)
+    // memcpy moves the raw encoding without violating aliasing rules. The
+    // conversion to float can use ARM's native FP16 -> F32 instruction.
+    static_assert(sizeof(__fp16) == sizeof(bits), "Expected 16-bit ARM FP16");
+    __fp16 half;
+    memcpy(&half, &bits, sizeof(half));
+    *result = (float)half;
+#else
+    // Portable IEEE-754 bit expansion, including signed zero and subnormals.
+    // memcpy avoids type-punning through an incompatible pointer type.
+    static_assert(sizeof(float) == sizeof(uint32_t), "Expected binary32 float");
+    uint32_t sign = ((uint32_t)bits & 0x8000u) << 16;
+    uint32_t exponent = (bits >> 10) & 0x1fu;
+    uint32_t fraction = bits & 0x03ffu;
+    uint32_t expanded;
+    if (exponent == 0) {
         if (fraction == 0) {
-            if (!sign) {
-                *result = INFINITY;
-            } else {
-                *result = -INFINITY;
-            }
+            expanded = sign;
         } else {
-            *result = NAN;
+            int power = -14;
+            while ((fraction & 0x400u) == 0) {
+                fraction <<= 1;
+                --power;
+            }
+            expanded = sign | ((uint32_t)(power + 127) << 23) |
+                       ((fraction & 0x3ffu) << 13);
         }
-    } else if (exponent == 0) {
-        // formula for subnormal values (eg: 0.000025)
-        // (-1)^sign * (0 + fraction) * 2^-14
-        *result = (powf(-1, sign)) * ldexpf((0 + fraction / 1024.0), -14);
+    } else if (exponent == 31) {
+        expanded = sign | 0x7f800000u | (fraction << 13);
+        // Quiet signaling NaNs before they enter F32 arithmetic.
+        if (fraction != 0) expanded |= 0x00400000u;
     } else {
-        // formula: sign * 2^(exponent - 15) * (1 + fraction / 1024)
-        *result = (ldexpf(powf(-1, sign), (int64_t) exponent - 15)) * (1 + fraction / 1024.0);
+        expanded = sign | ((exponent + 112u) << 23) | (fraction << 13);
     }
-
+    memcpy(result, &expanded, sizeof(expanded));
+#endif
     return 1;
 }
 

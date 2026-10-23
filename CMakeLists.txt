@@ -74,6 +74,19 @@ else()
     target_compile_options(inference PRIVATE -Wall -Wextra -Wpedantic)
 endif()
 
+# Optional synthetic microbenchmark; not registered as a correctness test.
+add_executable(quantized_matvec_benchmark
+    tests/quantized_matvec_benchmark.cpp
+    src/quantized_matvec.cpp
+    src/quantization.cpp
+)
+target_include_directories(quantized_matvec_benchmark PRIVATE include src)
+if(MSVC)
+    target_compile_options(quantized_matvec_benchmark PRIVATE /W4)
+else()
+    target_compile_options(quantized_matvec_benchmark PRIVATE -Wall -Wextra -Wpedantic)
+endif()
+
 include(CTest)
 
 if(BUILD_TESTING)
@@ -443,6 +456,7 @@ endif()
 if(ENGINE_OPENMP)
     foreach(engine_target IN ITEMS
         inference
+        quantized_matvec_benchmark
         tensor_reference_test
         quantized_matvec_reference_test
         quantized_matvec_failure_test

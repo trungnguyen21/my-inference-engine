@@ -1,1 +1,1 @@
-OMP_NUM_THREADS=8 ./build/inference --model models/qwen-2.5.gguf --prompt "What's the capital of France?" --max-tokens 16 --temperature 0 --top-p 1 --profile
+OMP_NUM_THREADS=4 ./build/inference --model models/qwen-2.5.gguf --prompt "What's the capital of France?" --max-tokens 16 --temperature 0 --top-p 1 --profile

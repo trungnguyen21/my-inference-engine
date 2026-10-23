@@ -1,0 +1,196 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>MHA · GQA · MQA — Interactive head sharing</title>
+  <style>
+    :root { color-scheme: dark; font-family: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; background: #0c1220; color: #eaf1fc; }
+    * { box-sizing: border-box; }
+    body { margin: 0; }
+    main { max-width: 1220px; padding: 44px 22px 80px; margin: auto; }
+    h1 { font-size: clamp(2rem, 4vw, 3.3rem); letter-spacing: -.05em; margin: 6px 0 12px; }
+    h2 { font-size: 1.2rem; margin: 0 0 8px; }
+    p { line-height: 1.55; }
+    .eyebrow { color: #6ee7d4; letter-spacing: .15em; text-transform: uppercase; font-size: .78rem; font-weight: 800; }
+    .intro { max-width: 760px; color: #aebed4; margin-bottom: 28px; }
+    .controls, .card, .inspector { border: 1px solid #293c56; background: #131f32; border-radius: 18px; }
+    .controls { padding: 20px 24px; display: flex; gap: 28px; flex-wrap: wrap; align-items: end; margin-bottom: 24px; }
+    .control { min-width: 175px; flex: 1; }
+    .control label { display: block; font-size: .86rem; font-weight: 700; margin-bottom: 12px; }
+    .control output { color: #6ee7d4; }
+    input[type=range], select { width: 100%; accent-color: #6ee7d4; }
+    select { background: #0d192b; border: 1px solid #425773; color: #eaf1fc; padding: 9px; border-radius: 8px; font: inherit; }
+    .hint { color: #aebed4; font-size: .83rem; margin: 7px 0 0; }
+    .cards { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 16px; align-items: start; }
+    .card { padding: 20px; min-width: 0; }
+    .card.mha { --accent: #81b5ff; }
+    .card.gqa { --accent: #6ee7d4; }
+    .card.mqa { --accent: #e9b6fa; }
+    .badge { display: inline-block; font-size: .72rem; font-weight: 800; color: var(--accent); border: 1px solid var(--accent); border-radius: 20px; padding: 3px 9px; margin-bottom: 14px; }
+    .description { color: #aebed4; font-size: .88rem; min-height: 3.1em; margin: 0 0 18px; }
+    .stats { display: flex; justify-content: space-between; gap: 8px; margin-bottom: 12px; font-size: .88rem; }
+    .stats strong { color: var(--accent); }
+    .track { background: #26374d; height: 9px; border-radius: 20px; overflow: hidden; margin-bottom: 5px; }
+    .fill { background: var(--accent); height: 100%; border-radius: inherit; transition: width .2s; }
+    .size { color: #aebed4; font-size: .82rem; margin-bottom: 20px; }
+    .groups { display: grid; gap: 8px; max-height: 410px; overflow-y: auto; padding-right: 4px; }
+    .group { background: #0d192b; border: 1px solid #31415a; border-radius: 10px; padding: 9px; transition: border-color .15s, background .15s; }
+    .group.active { border-color: var(--accent); background: #1a3040; }
+    .group-top { display: flex; justify-content: space-between; align-items: center; gap: 5px; flex-wrap: wrap; margin-bottom: 8px; }
+    .kv { font-size: .76rem; font-weight: 800; color: var(--accent); background: #23354a; padding: 4px 8px; border-radius: 6px; }
+    .group-label { color: #9cadc5; font-size: .72rem; }
+    .queries { display: flex; flex-wrap: wrap; gap: 5px; }
+    .query { cursor: pointer; color: #eaf1fc; background: #26384f; border: 1px solid #506681; border-radius: 6px; padding: 5px 7px; font-size: .78rem; font-weight: 750; }
+    .query:hover, .query:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
+    .query[aria-pressed=true] { background: var(--accent); color: #091526; border-color: var(--accent); }
+    .inspector { margin-top: 22px; padding: 18px 24px; }
+    .inspector p { color: #c0cee1; margin: 6px 0 0; }
+    .formula { font-size: .85rem; color: #aebed4; margin: 20px 2px 0; }
+    .formula code { color: #6ee7d4; }
+    @media (max-width: 880px) { .cards { grid-template-columns: 1fr; } .description { min-height: 0; } .groups { max-height: 300px; } }
+  </style>
+</head>
+<body>
+<main>
+  <div class="eyebrow">Interactive explainer · Q / K / V</div>
+  <h1>Who shares a KV head?</h1>
+  <p class="intro">All three methods use multiple <strong>query (Q) heads</strong>. Click any Q head below to see which <strong>key/value (K/V) head</strong> it reads. Change the settings to see how sharing affects the KV cache for <em>one layer, one sequence</em>.</p>
+
+  <section class="controls" aria-label="Model settings">
+    <div class="control">
+      <label for="q-heads">Query heads: <output id="q-count" for="q-heads">8</output></label>
+      <select id="q-heads"><option>4</option><option selected>8</option><option>12</option><option>16</option><option>32</option></select>
+      <p class="hint">Same number of Q heads in all panels.</p>
+    </div>
+    <div class="control">
+      <label for="gqa-heads">GQA KV heads: <output id="gqa-count" for="gqa-heads">2</output></label>
+      <select id="gqa-heads"></select>
+      <p class="hint">Must divide the Q head count.</p>
+    </div>
+    <div class="control">
+      <label for="tokens">Cached tokens: <output id="token-count" for="tokens">1024</output></label>
+      <input id="tokens" type="range" min="128" max="4096" step="128" value="1024">
+      <p class="hint">Longer sequences need more KV storage.</p>
+    </div>
+    <div class="control">
+      <label for="head-dim">Head dimension: <output id="dim-count" for="head-dim">128</output></label>
+      <select id="head-dim"><option>64</option><option selected>128</option><option>256</option></select>
+      <p class="hint">F32 values (4 bytes each).</p>
+    </div>
+  </section>
+
+  <section id="cards" class="cards" aria-label="Compare attention head layouts"></section>
+  <section class="inspector" aria-live="polite" aria-atomic="true">
+    <h2 id="selected-title">Select a query head</h2>
+    <p id="selected-description">Each panel maps the same Q head to a K/V head. The colored border shows its sharing group.</p>
+  </section>
+  <p class="formula">Per-layer KV cache = <code>tokens × KV heads × head dimension × 2 (K and V) × 4 bytes (F32)</code>. These are illustrative storage amounts, not measured speeds or model-quality scores. Causal masking and RoPE are separate from head sharing.</p>
+</main>
+<script>
+  "use strict";
+  const qSelect = document.getElementById("q-heads");
+  const gSelect = document.getElementById("gqa-heads");
+  const tokenInput = document.getElementById("tokens");
+  const dimSelect = document.getElementById("head-dim");
+  const cards = document.getElementById("cards");
+  let selectedQ = 0;
+
+  function refreshGqaChoices() {
+    const q = Number(qSelect.value);
+    const old = Number(gSelect.value) || 2;
+    gSelect.replaceChildren();
+    for (let kv = 2; kv < q; kv++) {
+      if (q % kv !== 0) continue;
+      const option = document.createElement("option");
+      option.value = String(kv);
+      option.textContent = String(kv);
+      gSelect.append(option);
+    }
+    gSelect.value = String([...gSelect.options].some(option => Number(option.value) === old) ? old : 2);
+    selectedQ = Math.min(selectedQ, q - 1);
+  }
+
+  function render() {
+    const q = Number(qSelect.value);
+    const gqa = Number(gSelect.value);
+    const tokens = Number(tokenInput.value);
+    const dim = Number(dimSelect.value);
+    document.getElementById("q-count").value = String(q);
+    document.getElementById("gqa-count").value = String(gqa);
+    document.getElementById("token-count").value = tokens.toLocaleString();
+    document.getElementById("dim-count").value = String(dim);
+    const layouts = [
+      { id: "mha", title: "Multi-head attention", kv: q, text: "Each Q head gets a separate K/V head. No K/V sharing." },
+      { id: "gqa", title: "Grouped-query attention", kv: gqa, text: "Several Q heads share each K/V head. Your Qwen2 engine uses this layout." },
+      { id: "mqa", title: "Multi-query attention", kv: 1, text: "Every Q head shares the same single K/V head." }
+    ];
+    cards.replaceChildren();
+    for (const layout of layouts) {
+      const card = document.createElement("article");
+      card.className = `card ${layout.id}`;
+      const groupSize = q / layout.kv;
+      const bytes = tokens * layout.kv * dim * 2 * 4;
+      const mib = (bytes / (1024 * 1024)).toFixed(2);
+      card.innerHTML = `<span class="badge">${layout.id.toUpperCase()}</span>
+        <h2>${layout.title}</h2><p class="description">${layout.text}</p>
+        <div class="stats"><span>${q} Q heads → <strong>${layout.kv} KV ${layout.kv === 1 ? "head" : "heads"}</strong></span><span>${groupSize} Q per KV</span></div>
+        <div class="track" role="img" aria-label="KV cache is ${layout.kv} of ${q} head groups compared with MHA"><div class="fill" style="width:${100 * layout.kv / q}%"></div></div>
+        <div class="size">KV cache: ${mib} MiB · ${layout.kv === q ? "baseline" : `${q / layout.kv}× smaller than MHA`}</div>
+        <div class="groups" aria-label="${layout.id.toUpperCase()} query to key/value head mapping"></div>`;
+      const groups = card.querySelector(".groups");
+      for (let kv = 0; kv < layout.kv; kv++) {
+        const group = document.createElement("div");
+        group.className = "group" + (Math.floor(selectedQ / groupSize) === kv ? " active" : "");
+        const top = document.createElement("div");
+        top.className = "group-top";
+        const head = document.createElement("span");
+        head.className = "kv";
+        head.textContent = `K${kv} / V${kv}`;
+        const label = document.createElement("span");
+        label.className = "group-label";
+        label.textContent = groupSize === 1 ? "private to 1 Q" : `shared by ${groupSize} Q heads`;
+        top.append(head, label);
+        group.append(top);
+        const queries = document.createElement("div");
+        queries.className = "queries";
+        for (let i = kv * groupSize; i < (kv + 1) * groupSize; i++) {
+          const button = document.createElement("button");
+          button.className = "query";
+          button.type = "button";
+          button.textContent = `Q${i}`;
+          button.setAttribute("aria-label", `${layout.id.toUpperCase()} query head ${i} uses key/value head ${kv}`);
+          button.setAttribute("aria-pressed", String(selectedQ === i));
+          button.addEventListener("click", () => { selectedQ = i; updateSelection(); });
+          queries.append(button);
+        }
+        group.append(queries);
+        groups.append(group);
+      }
+      cards.append(card);
+    }
+    updateSelection();
+  }
+
+  function updateSelection() {
+    const q = Number(qSelect.value);
+    const gqa = Number(gSelect.value);
+    const mappings = [selectedQ, Math.floor(selectedQ / (q / gqa)), 0];
+    document.getElementById("selected-title").textContent = `Query head Q${selectedQ}`;
+    document.getElementById("selected-description").textContent =
+      `MHA → K${mappings[0]}/V${mappings[0]} (private). GQA → K${mappings[1]}/V${mappings[1]} (shared with ${q / gqa} Q heads). MQA → K0/V0 (shared with all ${q} Q heads).`;
+    for (const [panel, kv] of [...cards.children].map((card, index) => [card, mappings[index]])) {
+      [...panel.querySelectorAll(".group")].forEach((group, index) => group.classList.toggle("active", index === kv));
+      panel.querySelectorAll(".query").forEach(button => button.setAttribute("aria-pressed", String(button.textContent === `Q${selectedQ}`)));
+    }
+  }
+
+  qSelect.addEventListener("change", () => { refreshGqaChoices(); render(); });
+  gSelect.addEventListener("change", render);
+  tokenInput.addEventListener("input", render);
+  dimSelect.addEventListener("change", render);
+  refreshGqaChoices();
+  render();
+</script>
+</body>
+</html>

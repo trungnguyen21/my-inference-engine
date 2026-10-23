@@ -30,6 +30,8 @@ how this layout reduces the K/V storage needed compared with multi-head attentio
 
 ![Multi-head and grouped-query attention compared, showing query heads sharing K/V heads](media/grouped_query_attention.png)
 
+[Explore MHA, GQA, and MQA interactively](docs/attention-heads-interactive.html) — open the HTML file in a browser to change head counts and inspect KV-cache sharing.
+
 ### Prefill, decode, and KV caching
 
 The animation shows prompt prefill followed by token-by-token decoding with
@@ -83,6 +85,13 @@ Metrics report generation elapsed time, throughput, process CPU percentage,
 and current resident RAM when supported by macOS or Linux. CPU percentage can
 exceed 100% when multiple cores are used.
 
+The completion summary always reports **time to first token**, measured from
+immediately after model loading through printing the first nonempty token piece.
+This includes prompt formatting, tokenization, inference-state setup, prefill,
+and the first token's sampling, decoding, and output. It reports `unavailable`
+if no text is emitted or timing is unavailable. The existing elapsed time and
+throughput cover generation after prefill.
+
 ## Tests
 
 The automated suite contains unit tests and four small integration tests using
@@ -106,6 +115,23 @@ The real-model acceptance executables and CLI smoke test have been removed.
 Older milestone documents retain historical evidence of their results; use
 the commands above for the current automated suite.
 
+### Quantized matvec microbenchmark
+
+To compare the four packed formats with the same synthetic matrix dimensions:
+
+```sh
+cmake --build build --target quantized_matvec_benchmark
+OMP_NUM_THREADS=4 ./build/quantized_matvec_benchmark            # 1024 rows, 1024 columns, 10 calls
+OMP_NUM_THREADS=4 ./build/quantized_matvec_benchmark 4096 2048 20
+```
+
+The output reports median milliseconds per complete matvec, millions of logical
+weights per second, and packed matrix size. Columns must be a multiple of 256.
+This benchmarks the existing packed dispatch and block-dot code, **not** a real
+model or isolated dot instructions. Formats store different bytes per weight;
+compare each format against itself before and after a kernel change. Use the
+same build, dimensions, and thread count for comparisons.
+
 ### Operation timings
 
 Add `--profile` to collect and print an operation breakdown after generation:
@@ -119,7 +145,11 @@ The report shows accumulated milliseconds and percentages for layer matvecs
 (Q/K/V, attention output, and FFN projections), attention scores/softmax/value
 aggregation, RMSNorm, RoPE, and the output matrix plus sampling. Output projection
 time is excluded from the layer matvec row. Projection timings include weight
-lookup, storage dispatch, and Q/K/V bias addition.
+lookup, storage dispatch, and Q/K/V bias addition. A second table reports the
+actual F32/Q5_0/Q8_0/Q4_K/Q6_K weight-kernel wall time and call count, with
+layer and output projections separated. Its shares are percentages of timed
+weight kernels only; these times are already included in the operation rows,
+not additional time. Both tables combine prefill and decode.
 
 Totals cover **prompt prefill and generation**, including full-prefix
 recomputation, across all forward and sampling calls. Percentages use total

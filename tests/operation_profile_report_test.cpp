@@ -5,7 +5,8 @@
 #include <unistd.h>
 #include <string>
 
-static std::string capture_report(const OperationProfile *profile)
+template <typename PrintFn>
+static std::string capture_output(PrintFn print)
 {
     fflush(stdout);
     FILE *capture = tmpfile();
@@ -13,7 +14,7 @@ static std::string capture_report(const OperationProfile *profile)
     int saved_stdout = dup(STDOUT_FILENO);
     assert(saved_stdout >= 0);
     assert(dup2(fileno(capture), STDOUT_FILENO) >= 0);
-    terminal_print_operation_profile(profile);
+    print();
     fflush(stdout);
     assert(dup2(saved_stdout, STDOUT_FILENO) >= 0);
     close(saved_stdout);
@@ -26,6 +27,11 @@ static std::string capture_report(const OperationProfile *profile)
     }
     fclose(capture);
     return output;
+}
+
+static std::string capture_report(const OperationProfile *profile)
+{
+    return capture_output([profile]() { terminal_print_operation_profile(profile); });
 }
 
 static void expect_row(const std::string &output, const char *label,
@@ -49,6 +55,8 @@ int main()
     assert(empty.find("inf") == std::string::npos);
     expect_row(empty, "Total profiled time", "0.000", nullptr);
     expect_row(empty, "matvec (projections + FFN)", "0.000", "0.00%");
+    assert(empty.find("Weight kernels by format") != std::string::npos);
+    expect_row(empty, "Q5_0", "0.000", "0.00%");
 
     profile.matvec_seconds = 0.78;
     profile.attention_seconds = 0.09;
@@ -59,6 +67,10 @@ int main()
     profile.forward_seconds = 0.97;
     profile.forward_calls = 24;
     profile.sampling_calls = 4;
+    profile.weight_layer_seconds[PROFILE_Q5_0] = 0.4;
+    profile.weight_layer_calls[PROFILE_Q5_0] = 20;
+    profile.weight_output_seconds[PROFILE_Q8_0] = 0.1;
+    profile.weight_output_calls[PROFILE_Q8_0] = 4;
     std::string output = capture_report(&profile);
     assert(output.find("Forward calls: 24 | Sampling calls: 4") != std::string::npos);
     expect_row(output, "matvec (projections + FFN)", "780.000", "78.00%");
@@ -67,6 +79,8 @@ int main()
     expect_row(output, "RoPE", "10.000", "1.00%");
     expect_row(output, "output matrix + sampling", "100.000", "10.00%");
     expect_row(output, "Total profiled time", "1000.000", nullptr);
+    expect_row(output, "Q5_0", "400.000", "80.00%");
+    expect_row(output, "Q8_0", "100.000", "20.00%");
 
     /* Unclassified forward work contributes to the denominator and is visible. */
     profile.forward_seconds += 1.0;
@@ -75,6 +89,24 @@ int main()
     expect_row(output, "matvec (projections + FFN)", "780.000", "39.00%");
     expect_row(output, "output matrix + sampling", "100.000", "5.00%");
     expect_row(output, "Total profiled time", "2000.000", nullptr);
+
+    UsageSnapshot start = {}, end = {};
+    start.available = end.available = 1;
+    end.wall_seconds = 2.0;
+    std::string summary = capture_output([&]() {
+        terminal_finish_generation(2, 2.0, 12.3456, &start, &end);
+    });
+    assert(summary.find("Time to first token: 12.346 s (excludes model loading)\n") !=
+           std::string::npos);
+    assert(summary.find("Elapsed time: 2.000 s\n") != std::string::npos);
+    summary = capture_output([&]() {
+        terminal_finish_generation(2, 2.0, -1.0, &start, &end);
+    });
+    assert(summary.find("Time to first token: unavailable\n") != std::string::npos);
+    summary = capture_output([&]() {
+        terminal_finish_generation(2, 2.0, 0.0, &start, &end);
+    });
+    assert(summary.find("Time to first token: 0.000 s") != std::string::npos);
     puts("Operation report percentages, totals, disabled and empty cases passed.");
     return 0;
 }
