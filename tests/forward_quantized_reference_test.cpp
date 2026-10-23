@@ -212,6 +212,23 @@ int main(int argc, char **argv)
         assert(((Qwen2InferenceState *)state.implementation)->token_count == token + 1);
     }
 
+    /* Skipping intermediate vocabulary logits must preserve the packed KV
+     * path and produce the same final result with only one output projection. */
+    InferenceState prefill = {};
+    assert(ops->state_init(&actual.model, &prefill, 3, error, sizeof(error)) == 1);
+    prefill.profile.enabled = 1;
+    assert(ops->forward_token_no_logits(&actual.model, &prefill, 0,
+                                        error, sizeof(error)) == 1);
+    assert(prefill.logits_count == 0);
+    for (int format = 0; format < PROFILE_WEIGHT_FORMAT_COUNT; ++format) {
+        assert(prefill.profile.weight_output_calls[format] == 0);
+    }
+    forward_success(&actual, &prefill, 1);
+    compare_logits(&prefill, &state);
+    assert(prefill.profile.weight_output_calls[
+        (packed_parts & PACK_OUTPUT) ? PROFILE_Q8_0 : PROFILE_F32] == 1);
+    ops->state_destroy(&prefill);
+
     /* Force a late failure, repair the tensor, then retry the same position. */
     GgufTensorInfo *output = &actual.tensors[14];
     assert(strcmp(output->name, "output.weight") == 0);

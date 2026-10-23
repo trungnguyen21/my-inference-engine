@@ -220,10 +220,14 @@ int app_run(const AppConfig *config)
 
     state.profile.enabled = config->profile;
 
-    /* Prefill: forward each prompt token once; retain the last token's logits. */
+    /* KV state is needed for every prompt token; only the final token's logits
+     * will be sampled. Avoid projecting intermediate tokens to the vocabulary. */
     for (i = 0; i < prompt_token_count; ++i) {
-        if (!engine_forward_token(&model, &state, prompt_token_ids[i],
-                                  error, sizeof(error))) {
+        int ok = (i + 1 == prompt_token_count)
+            ? engine_forward_token(&model, &state, prompt_token_ids[i], error, sizeof(error))
+            : engine_forward_token_no_logits(&model, &state, prompt_token_ids[i],
+                                             error, sizeof(error));
+        if (!ok) {
             terminal_print_error(error);
             goto cleanup;
         }

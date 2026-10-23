@@ -278,6 +278,39 @@ static void test_cached_forward_matches_full_prefix_after_each_token(void)
     inference_state_destroy(&cached);
 }
 
+static void test_prefill_skips_unused_logits_but_preserves_final_result(void)
+{
+    ForwardFixture fixture;
+    InferenceState reference = {}, prefill = {};
+    char error[ENGINE_ERROR_CAPACITY] = {};
+    initialize_fixture(&fixture);
+    assert(inference_state_init(&fixture.model, &reference, 3, error, sizeof(error)) == 1);
+    assert(inference_state_init(&fixture.model, &prefill, 3, error, sizeof(error)) == 1);
+    prefill.profile.enabled = 1;
+    prefill.logits[0] = 123.0f;
+    for (int token = 0; token < 2; ++token) {
+        assert(engine_forward_token(&fixture.model, &reference, token, error, sizeof(error)) == 1);
+        assert(engine_forward_token_no_logits(&fixture.model, &prefill, token,
+                                              error, sizeof(error)) == 1);
+        assert(prefill.logits_count == 0 && prefill.logits[0] == 123.0f);
+        assert(prefill.profile.weight_output_calls[PROFILE_F32] == 0);
+        assert(((Qwen2InferenceState *)prefill.implementation)->token_count == token + 1);
+    }
+    assert(engine_forward_token_no_logits(&fixture.model, &prefill, -1,
+                                          error, sizeof(error)) == 0);
+    assert(((Qwen2InferenceState *)prefill.implementation)->token_count == 2);
+    assert(engine_forward_token(&fixture.model, &reference, 2, error, sizeof(error)) == 1);
+    assert(engine_forward_token(&fixture.model, &prefill, 2, error, sizeof(error)) == 1);
+    assert(prefill.profile.weight_output_calls[PROFILE_F32] == 1);
+    assert(prefill.profile.forward_calls == 3);
+    assert(prefill.logits_count == FIXTURE_VOCAB_SIZE);
+    for (int id = 0; id < FIXTURE_VOCAB_SIZE; ++id) {
+        assert(floats_nearly_equal(prefill.logits[id], reference.logits[id]));
+    }
+    inference_state_destroy(&reference);
+    inference_state_destroy(&prefill);
+}
+
 static void test_forward_rejects_invalid_token_and_exhausted_context(void)
 {
     ForwardFixture fixture;
@@ -337,6 +370,7 @@ int main(void)
     test_model_configuration_validates_output_norm();
     test_two_token_full_prefix_forward();
     test_cached_forward_matches_full_prefix_after_each_token();
+    test_prefill_skips_unused_logits_but_preserves_final_result();
     test_forward_rejects_invalid_token_and_exhausted_context();
     test_attention_failure_reports_error_and_allows_retry();
 

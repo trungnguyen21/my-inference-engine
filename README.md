@@ -78,7 +78,8 @@ change floating-point rounding; see the [beginner's NEON guide](docs/quantized-n
 Use `--temperature 0` for the implemented greedy sampler. The CLI default
 is still `0.8`; nonzero-temperature/top-p sampling reports a clear unsupported
 error until that later feature is implemented. Prefill currently processes prompt
-tokens individually, including an output projection for each token.
+tokens individually, but skips the final normalization and vocabulary projection
+for every prompt token except the last. Batched prefill is not yet implemented.
 
 The CLI accepts `--max-tokens`, `--temperature`, and `--top-p`; run with
 `--help` to see defaults and accepted values. `src/app.cpp` contains a separate

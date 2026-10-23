@@ -205,6 +205,27 @@ int engine_forward_token(const Model *model, InferenceState *state,
                                                         error, error_capacity);
 }
 
+int engine_forward_token_no_logits(const Model *model, InferenceState *state,
+                                   int token_id, char *error, int error_capacity)
+{
+    if (model == nullptr || model->implementation == nullptr ||
+        state == nullptr || state->implementation == nullptr) {
+        set_error(error, error_capacity, "Model or inference state is not initialized.");
+        return 0;
+    }
+    const EngineModel *implementation = (const EngineModel *)model->implementation;
+    const EngineStateHeader *state_header = (const EngineStateHeader *)state->implementation;
+    if (implementation->architecture == nullptr ||
+        implementation->architecture->forward_token_no_logits == nullptr ||
+        state_header->architecture != implementation->architecture) {
+        set_error(error, error_capacity,
+                  "Model and inference state do not support no-logits forwarding.");
+        return 0;
+    }
+    return implementation->architecture->forward_token_no_logits(
+        model, state, token_id, error, error_capacity);
+}
+
 void inference_state_destroy(InferenceState *state)
 {
     EngineStateHeader *state_header;

@@ -1111,10 +1111,11 @@ int qwen2_forward_token_reference(
     return 1;
 }
 
-int qwen2_forward_token_cached(
+static int qwen2_forward_token_cached_impl(
     const Model *model,
     InferenceState *state,
     int token_id,
+    bool produce_logits,
     char *error,
     int error_capacity
 )
@@ -1386,8 +1387,18 @@ int qwen2_forward_token_cached(
 
     }
 
-    // Only the LAST position supplies next-token logits.
-    //normalized = rms_norm(activations[last], output_norm_weight);
+    // Intermediate prompt tokens still populate their layer KV slots, but
+    // their final norm and vocabulary projection would never be used.
+    if (!produce_logits) {
+        if (profile->enabled) ++profile->forward_calls;
+        state->logits_count = 0;
+        private_state->token_ids[position] = token_id;
+        private_state->token_count = prefix_length;
+        if (error != nullptr && error_capacity > 0) error[0] = '\0';
+        return 1;
+    }
+
+    // Only the last prompt token and later generated tokens need next-token logits.
     if (!gguf_get_f32_tensor_view(file, "output_norm.weight", &view) ||
         view.dimension_count != 1 ||
         view.dimensions[0] != (uint64_t)model->config.dim) {
@@ -1436,6 +1447,20 @@ int qwen2_forward_token_cached(
     private_state->token_count = prefix_length;
     if (error != nullptr && error_capacity > 0) error[0] = '\0';
     return 1;
+}
+
+int qwen2_forward_token_cached(const Model *model, InferenceState *state,
+                               int token_id, char *error, int error_capacity)
+{
+    return qwen2_forward_token_cached_impl(model, state, token_id, true,
+                                          error, error_capacity);
+}
+
+static int qwen2_forward_token_no_logits(const Model *model, InferenceState *state,
+                                         int token_id, char *error, int error_capacity)
+{
+    return qwen2_forward_token_cached_impl(model, state, token_id, false,
+                                          error, error_capacity);
 }
 
 static void qwen2_state_destroy(InferenceState *state)
@@ -1512,7 +1537,8 @@ const ArchitectureOps *qwen2_architecture_ops(void)
         qwen2_state_init,
         qwen2_forward_token_cached,
         qwen2_state_destroy,
-        qwen2_format_prompt
+        qwen2_format_prompt,
+        qwen2_forward_token_no_logits
     };
 
     return &ops;

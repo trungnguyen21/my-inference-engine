@@ -19,7 +19,7 @@ enum Failure {
 };
 
 static Failure failure;
-static std::vector<int> forwards, samples, decoded;
+static std::vector<int> forwards, skipped_logits, samples, decoded;
 static std::vector<std::string> events;
 static std::string printed, reported_error;
 static int loaded, unloaded, initialized, destroyed, finished, sampled, captured;
@@ -34,7 +34,7 @@ static float logits[7];
 static void reset(Failure selected, const std::vector<int> &script)
 {
     failure = selected;
-    forwards.clear(); decoded.clear(); events.clear();
+    forwards.clear(); skipped_logits.clear(); decoded.clear(); events.clear();
     samples = script;
     printed.clear(); reported_error.clear();
     loaded = unloaded = initialized = destroyed = finished = sampled = captured = 0;
@@ -117,6 +117,7 @@ int engine_forward_token(const Model *, InferenceState *state, int id,
         (failure == DECODE_FORWARD && forwards.size() == 3)) return fail(error, capacity);
     /* A recognizable marker proves the sampler receives the latest forward. */
     logits[0] = (float)id;
+    state->logits_count = 7;
     if (failure == NULL_LOGITS) state->logits = nullptr;
     if (failure == WRONG_LOGIT_COUNT) state->logits_count = 6;
     if (state->profile.enabled) {
@@ -124,6 +125,15 @@ int engine_forward_token(const Model *, InferenceState *state, int id,
         state->profile.matvec_seconds += 0.25;
         state->profile.forward_seconds += 0.5;
     }
+    return 1;
+}
+
+int engine_forward_token_no_logits(const Model *model, InferenceState *state, int id,
+                                   char *error, int capacity)
+{
+    skipped_logits.push_back(id);
+    if (!engine_forward_token(model, state, id, error, capacity)) return 0;
+    state->logits_count = 0;
     return 1;
 }
 
@@ -203,6 +213,7 @@ static void expect_success(int limit, const std::vector<int> &script,
     config.profile = profile;
     assert(app_run(&config) == 0);
     assert(forwards == expected_forwards && printed == text);
+    assert(skipped_logits == std::vector<int>(1, 1)); /* Only first prompt token. */
     assert(loaded == 1 && unloaded == 1 && initialized == 1 && destroyed == 1);
     assert(finished == 1 && reported_tokens == count && sampled == count);
     const bool has_text = text[0] != '\0';

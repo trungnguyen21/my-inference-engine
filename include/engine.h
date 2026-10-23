@@ -82,8 +82,8 @@ int inference_state_init(const Model *model, InferenceState *state,
                          char *error, int error_capacity);
 
 /*
- * Append one input token to state history, recompute the complete prefix from
- * its first token, and calculate logits for the token after the prefix. model
+ * Append one input token to the cached state and calculate logits for the
+ * token after it. model
  * and state must be a matched successful load/init pair. token_id
  * must be in [0, model->config.vocab_size), and state must have a free context
  * position. The selected architecture backend performs embedding lookup, its
@@ -91,18 +91,22 @@ int inference_state_init(const Model *model, InferenceState *state,
  * It writes
  * model->config.vocab_size finite F32 values to state->logits, sets
  * state->logits_count to that count, and advances the internal token count
- * exactly once. Earlier activations and K/V vectors are recomputed on each
- * call; they are not reused from the previous call.
+ * exactly once. Earlier keys and values remain in the per-layer KV cache.
  *
  * Return 1 only after all of those outputs are valid. Return 0 with an error
  * for invalid arguments, exhausted context, malformed model tensor data, or a
  * failed tensor operation. A failed call must not advance the state position.
  */
-/* TODO(kv-cache/08): At the callback switch, describe incremental execution
- * above while preserving finite-logit, capacity, and failure/commit guarantees.
- */
 int engine_forward_token(const Model *model, InferenceState *state,
                          int token_id, char *error, int error_capacity);
+
+/* Advance one prompt token through the cached layers without computing its
+ * unused vocabulary logits. On success, invalidate state->logits_count so
+ * callers cannot sample stale logits. Follow with engine_forward_token for
+ * the last prompt token (and for each generated token needing next logits).
+ * Requires an architecture that implements forward_token_no_logits. */
+int engine_forward_token_no_logits(const Model *model, InferenceState *state,
+                                   int token_id, char *error, int error_capacity);
 
 /* Free all state-owned allocations and clear the caller's InferenceState. */
 void inference_state_destroy(InferenceState *state);
