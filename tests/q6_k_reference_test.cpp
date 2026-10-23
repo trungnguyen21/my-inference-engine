@@ -130,6 +130,42 @@ static void test_q6_k_dot_f32(void)
     assert(floats_nearly_equal(result, 84.5f));
 }
 
+/* Exercise every region, both nibble sources, and signed per-16 scales. */
+static void test_q6_k_dot_full_blocks(void)
+{
+    uint32_t rng = 0x12345678u;
+    for (int trial = 0; trial < 128; ++trial) {
+        Q6_KBlock block;
+        float input[Q6_K_BLOCK_ELEMENTS];
+        float weights[Q6_K_BLOCK_ELEMENTS];
+        float actual = 0.0f;
+        block.scale_f16_bits = (trial & 1) ? 0xb800u : 0x3800u;
+        for (int i = 0; i < Q6_K_LOWER_BITS_BYTES; ++i) {
+            rng = rng * 1664525u + 1013904223u;
+            block.lower_bits[i] = (uint8_t)(rng >> 24);
+        }
+        for (int i = 0; i < Q6_K_UPPER_BITS_BYTES; ++i) {
+            rng = rng * 1664525u + 1013904223u;
+            block.upper_bits[i] = (uint8_t)(rng >> 24);
+        }
+        for (int i = 0; i < Q6_K_SCALE_COUNT; ++i) {
+            rng = rng * 1664525u + 1013904223u;
+            block.scales[i] = (int8_t)(rng >> 24);
+        }
+        for (int i = 0; i < Q6_K_BLOCK_ELEMENTS; ++i) {
+            rng = rng * 1664525u + 1013904223u;
+            input[i] = (float)((int)(rng >> 24) - 128) / 32.0f;
+        }
+        assert(q6_k_dequantize_block(&block, weights) == 1);
+        float expected = 0.0f;
+        for (int i = 0; i < Q6_K_BLOCK_ELEMENTS; ++i) {
+            expected += weights[i] * input[i];
+        }
+        assert(q6_k_dot_f32(&block, input, &actual) == 1);
+        assert(fabsf(actual - expected) <= 0.01f + 5e-5f * fabsf(expected));
+    }
+}
+
 static void test_invalid_arguments(void)
 {
     Q6_KBlock block;
@@ -166,6 +202,7 @@ int main(void)
     test_q6_k_unpack_value();
     test_q6_k_dequantize_block();
     test_q6_k_dot_f32();
+    test_q6_k_dot_full_blocks();
     test_invalid_arguments();
 
     printf("All Q6_K reference tests passed.\n");

@@ -85,6 +85,39 @@ static void test_q5_0_dot_f32(void)
     assert(floats_nearly_equal(result, -25.0f));
 }
 
+/* Exercise every packed bit position with nonzero inputs, including negative
+ * scales and values. The SIMD reduction may sum in a different order. */
+static void test_q5_0_dot_all_bits(void)
+{
+    uint32_t rng = 0x12345678u;
+    for (int trial = 0; trial < 128; ++trial) {
+        Q5_0Block block;
+        float input[Q5_0_BLOCK_ELEMENTS];
+        float weights[Q5_0_BLOCK_ELEMENTS];
+        float actual = 0.0f;
+        block.scale_f16_bits = (trial & 1) ? 0xb800u : 0x3800u;
+        for (int i = 0; i < 4; ++i) {
+            rng = rng * 1664525u + 1013904223u;
+            block.high_bits[i] = (uint8_t)(rng >> 24);
+        }
+        for (int i = 0; i < 16; ++i) {
+            rng = rng * 1664525u + 1013904223u;
+            block.packed_nibbles[i] = (uint8_t)(rng >> 24);
+        }
+        for (int i = 0; i < Q5_0_BLOCK_ELEMENTS; ++i) {
+            rng = rng * 1664525u + 1013904223u;
+            input[i] = (float)((int)(rng >> 24) - 128) / 32.0f;
+        }
+        assert(q5_0_dequantize_block(&block, weights) == 1);
+        float expected = 0.0f;
+        for (int i = 0; i < Q5_0_BLOCK_ELEMENTS; ++i) {
+            expected += weights[i] * input[i];
+        }
+        assert(q5_0_dot_f32(&block, input, &actual) == 1);
+        assert(fabsf(actual - expected) <= 1e-4f + 2e-5f * fabsf(expected));
+    }
+}
+
 static void test_invalid_arguments(void)
 {
     Q5_0Block block;
@@ -108,6 +141,7 @@ int main(void)
 
     test_q5_0_dequantize_block();
     test_q5_0_dot_f32();
+    test_q5_0_dot_all_bits();
     test_invalid_arguments();
 
     printf("All Q5_0 reference tests passed.\n");

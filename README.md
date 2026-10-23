@@ -7,14 +7,16 @@ metadata keys, tensor checks, and forward pass are isolated in
 `qwen2_architecture.cpp`. `tokenizer.cpp` delegates GGUF tokenizer behavior to
 a vocabulary-only llama.cpp adapter. CPU tensor math and the complete F32
 reference forward pass are implemented; no external inference runtime executes
-model layers. Each forward call recomputes the complete token history without
-retaining K/V results between calls.
+model layers. Token-by-token inference uses a per-layer K/V cache; a full-prefix
+reference path remains available for correctness checks.
 
 Packed embedding-row decoding, packed layer/output projections, greedy
 selection, and single-user Qwen2.5 instruction prompt formatting are implemented.
 The existing app loop prints generated token pieces and stops at EOS or the
 requested token limit. See the [roadmap to generated text](docs/roadmap-to-generated-text.md)
-for the function contracts, tests, and commands. Optimization is deferred.
+for the function contracts, tests, and commands. For an explanation of the
+implemented packed-weight SIMD optimization, start with the
+[beginner's NEON guide](docs/quantized-neon-beginners-guide.md).
 
 The [optimization roadmap](docs/optimization-roadmap.md) ranks proposed changes
 from small math fixes through one-pass prefill, KV caching, CPU kernels, and a
@@ -35,9 +37,10 @@ how this layout reduces the K/V storage needed compared with multi-head attentio
 ### Prefill, decode, and KV caching
 
 The animation shows prompt prefill followed by token-by-token decoding with
-a persistent KV cache. KV caching and one-pass prefill are planned in the
-[optimization roadmap](docs/optimization-roadmap.md); the current backend
-recomputes the full token history on each forward call.
+a persistent KV cache. The current backend uses a persistent per-layer KV cache during token-by-token
+inference. A separate batched, one-pass prefill is not yet implemented; see the
+[optimization roadmap](docs/optimization-roadmap.md) for historical context
+and further proposed changes.
 
 ![Animation of prompt prefill and autoregressive decoding with a growing KV cache](media/prefill_decode_kv_cache.gif)
 
@@ -68,13 +71,14 @@ OMP_NUM_THREADS=4 ./build/inference --model models/qwen-2.5.gguf \
 To build serial CPU kernels, configure with
 `cmake -S . -B build -DENGINE_OPENMP=OFF` and rebuild. Re-enable with
 `-DENGINE_OPENMP=ON`. Both F32 and packed quantized matvecs parallelize their
-independent output rows. Q5_0, Q8_0, Q4_K, and Q6_K keep their existing unpacking
-and accumulation order within each row.
+independent output rows. On ARM64, Q5_0, Q8_0, Q4_K, and Q6_K use NEON within
+each block; other builds retain scalar block-dot kernels. SIMD summation may
+change floating-point rounding; see the [beginner's NEON guide](docs/quantized-neon-beginners-guide.md).
 
 Use `--temperature 0` for the implemented greedy sampler. The CLI default
 is still `0.8`; nonzero-temperature/top-p sampling reports a clear unsupported
-error until that later feature is implemented. Full-prefix recomputation can
-make prefill and generation slow.
+error until that later feature is implemented. Prefill currently processes prompt
+tokens individually, including an output projection for each token.
 
 The CLI accepts `--max-tokens`, `--temperature`, and `--top-p`; run with
 `--help` to see defaults and accepted values. `src/app.cpp` contains a separate
@@ -151,8 +155,8 @@ layer and output projections separated. Its shares are percentages of timed
 weight kernels only; these times are already included in the operation rows,
 not additional time. Both tables combine prefill and decode.
 
-Totals cover **prompt prefill and generation**, including full-prefix
-recomputation, across all forward and sampling calls. Percentages use total
+Totals cover **prompt prefill and generation**, including cached forward
+calls for each prompt and generated token, across all forward and sampling calls. Percentages use total
 forward time plus sampling time; an **other forward work** row accounts for
 embeddings, SwiGLU, residual additions, copies, validation, and instrumentation
 overhead. Loading, tokenization, and terminal output are excluded. These totals

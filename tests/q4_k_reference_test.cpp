@@ -138,6 +138,40 @@ static void test_q4_k_dot_f32(void)
     assert(floats_nearly_equal(result, 363.0f));
 }
 
+/* Exercise both nibble halves, all subblock scale/min fields, and mixed
+ * positive/negative inputs. Compare against independent block decoding. */
+static void test_q4_k_dot_full_blocks(void)
+{
+    uint32_t rng = 0x12345678u;
+    for (int trial = 0; trial < 128; ++trial) {
+        Q4_KBlock block;
+        float input[Q4_K_BLOCK_ELEMENTS];
+        float weights[Q4_K_BLOCK_ELEMENTS];
+        float actual = 0.0f;
+        block.scale_f16_bits = (trial & 1) ? 0xb800u : 0x3800u;
+        block.min_f16_bits = (trial & 2) ? 0xb400u : 0x3400u;
+        for (int i = 0; i < Q4_K_SCALE_AND_MIN_BYTES; ++i) {
+            rng = rng * 1664525u + 1013904223u;
+            block.scale_and_min[i] = (uint8_t)(rng >> 24);
+        }
+        for (int i = 0; i < Q4_K_BLOCK_ELEMENTS / 2; ++i) {
+            rng = rng * 1664525u + 1013904223u;
+            block.packed_nibbles[i] = (uint8_t)(rng >> 24);
+        }
+        for (int i = 0; i < Q4_K_BLOCK_ELEMENTS; ++i) {
+            rng = rng * 1664525u + 1013904223u;
+            input[i] = (float)((int)(rng >> 24) - 128) / 32.0f;
+        }
+        assert(q4_k_dequantize_block(&block, weights) == 1);
+        float expected = 0.0f;
+        for (int i = 0; i < Q4_K_BLOCK_ELEMENTS; ++i) {
+            expected += weights[i] * input[i];
+        }
+        assert(q4_k_dot_f32(&block, input, &actual) == 1);
+        assert(fabsf(actual - expected) <= 0.002f + 5e-5f * fabsf(expected));
+    }
+}
+
 static void test_invalid_arguments(void)
 {
     Q4_KBlock block;
@@ -176,6 +210,7 @@ int main(void)
     test_q4_k_unpack_scale_min();
     test_q4_k_dequantize_block();
     test_q4_k_dot_f32();
+    test_q4_k_dot_full_blocks();
     test_invalid_arguments();
 
     printf("All Q4_K reference tests passed.\n");
