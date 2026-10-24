@@ -41,6 +41,11 @@ typedef int (*ArchitectureForwardTokenFn)(
     int error_capacity
 );
 
+typedef int (*ArchitecturePrefillFn)(
+    const Model *model, InferenceState *state, const int *ids, int count,
+    char *error, int error_capacity
+);
+
 typedef void (*ArchitectureStateDestroyFn)(InferenceState *state);
 
 /* Format one user message plus the assistant-generation prefix. */
@@ -63,6 +68,8 @@ struct ArchitectureOps {
     /* Advance one cached token without final normalization or vocabulary logits.
      * Only used for intermediate prompt tokens; the next call must produce logits. */
     ArchitectureForwardTokenFn forward_token_no_logits;
+    /* Append a whole prompt segment and publish only its final logits. */
+    ArchitecturePrefillFn prefill_tokens;
 };
 
 /*

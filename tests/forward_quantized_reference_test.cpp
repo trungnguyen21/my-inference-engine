@@ -229,6 +229,24 @@ int main(int argc, char **argv)
         (packed_parts & PACK_OUTPUT) ? PROFILE_Q8_0 : PROFILE_F32] == 1);
     ops->state_destroy(&prefill);
 
+    InferenceState checked_prefill = {};
+    const int prompt_ids[] = {0, 1};
+    assert(ops->state_init(&actual.model, &checked_prefill, 3, error, sizeof(error)) == 1);
+    assert(ops->prefill_tokens(&actual.model, &checked_prefill, prompt_ids, 2,
+                               error, sizeof(error)) == 1);
+    compare_logits(&checked_prefill, &state);
+    const Qwen2InferenceState *cached_state = (const Qwen2InferenceState *)state.implementation;
+    const Qwen2InferenceState *batch_state = (const Qwen2InferenceState *)checked_prefill.implementation;
+    size_t kv_bytes = (size_t)actual.model.config.n_layers * 3 * KV_DIM * sizeof(float);
+    size_t kv_count = kv_bytes / sizeof(float);
+    for (size_t i = 0; i < kv_count; ++i) {
+        float key_tolerance = 0.0001f + 0.001f * fabsf(cached_state->keys[i]);
+        float value_tolerance = 0.0001f + 0.001f * fabsf(cached_state->values[i]);
+        assert(fabsf(cached_state->keys[i] - batch_state->keys[i]) <= key_tolerance);
+        assert(fabsf(cached_state->values[i] - batch_state->values[i]) <= value_tolerance);
+    }
+    ops->state_destroy(&checked_prefill);
+
     /* Force a late failure, repair the tensor, then retry the same position. */
     GgufTensorInfo *output = &actual.tensors[14];
     assert(strcmp(output->name, "output.weight") == 0);

@@ -201,6 +201,25 @@ static void test_multirow_multiblock_matrix(uint32_t type)
 #endif
 }
 
+static void test_q8_0_batched_matrix(void)
+{
+    Q8_0Block blocks[2] = {};
+    GgufQuantizedTensorView view;
+    float inputs[2 * Q8_0_BLOCK_ELEMENTS] = {};
+    float expected[4] = {}, outputs[4] = {};
+    blocks[0].scale_f16_bits = blocks[1].scale_f16_bits = 0x3800u;
+    blocks[0].quantized_values[0] = 2; blocks[0].quantized_values[1] = -4;
+    blocks[1].quantized_values[0] = 6; blocks[1].quantized_values[1] = 2;
+    inputs[0] = 1; inputs[1] = 2;
+    inputs[Q8_0_BLOCK_ELEMENTS] = -1; inputs[Q8_0_BLOCK_ELEMENTS + 1] = 3;
+    setup_matrix_view(&view, blocks, ENGINE_GGML_TYPE_Q8_0,
+                      Q8_0_BLOCK_ELEMENTS, 2, Q8_0_BLOCK_ELEMENTS, Q8_0_BLOCK_BYTES);
+    assert(quantized_tensor_matvec_f32(&view, inputs, 32, expected, 2));
+    assert(quantized_tensor_matvec_f32(&view, inputs + 32, 32, expected + 2, 2));
+    assert(quantized_tensor_matmul_f32(&view, inputs, 32, 2, outputs, 2));
+    for (int i = 0; i < 4; ++i) assert(floats_nearly_equal(outputs[i], expected[i]));
+}
+
 static void test_invalid_arguments(void)
 {
     Q8_0Block block;
@@ -225,6 +244,7 @@ static void test_invalid_arguments(void)
     assert(quantized_tensor_matvec_f32(&view, input, 32, nullptr, 1) == 0);
     assert(quantized_tensor_matvec_f32(&view, input, 31, output, 1) == 0);
     assert(quantized_tensor_matvec_f32(&view, input, 32, output, 2) == 0);
+    assert(quantized_tensor_matmul_f32(&view, input, 32, 0, output, 1) == 0);
 
     view.dimension_count = 1;
     assert(quantized_tensor_matvec_f32(&view, input, 32, output, 1) == 0);
@@ -246,6 +266,7 @@ int main(void)
     test_q5_0_single_row_matrix();
     test_q4_k_single_row_matrix();
     test_q6_k_single_row_matrix();
+    test_q8_0_batched_matrix();
     test_multirow_multiblock_matrix(ENGINE_GGML_TYPE_Q5_0);
     test_multirow_multiblock_matrix(ENGINE_GGML_TYPE_Q8_0);
     test_multirow_multiblock_matrix(ENGINE_GGML_TYPE_Q4_K);

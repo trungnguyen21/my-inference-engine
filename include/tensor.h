@@ -33,6 +33,13 @@ int tensor_matvec_f32(
     float *output
 );
 
+// Multiply one row-major matrix by a token-major batch of input vectors.
+// inputs is [batch_count, columns], outputs is [batch_count, rows].
+int tensor_matmul_f32(
+    const float *matrix, int rows, int columns,
+    const float *inputs, int batch_count, float *outputs
+);
+
 // Apply RMS normalization followed by one learned weight per element.
 // epsilon must be positive. Returns 1 on success and 0 for invalid arguments.
 int tensor_rms_norm_f32(

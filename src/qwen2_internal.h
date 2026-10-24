@@ -4,6 +4,8 @@
 #include "engine.h"
 #include "engine_internal.h"
 
+#define QWEN2_PREFILL_CHUNK_SIZE 8
+
 /*
  * Private state for the Qwen2 full-prefix backend. Other architecture modules
  * may define a different layout, but their first member must be
@@ -38,15 +40,15 @@ typedef struct Qwen2InferenceState {
      */
     float *keys;                    /* [layer][position][KV head][head dimension] */
     float *values;                  /* [layer][position][KV head][head dimension] */
-    float *normalized;              /* model dim */
-    float *query;                   /* n_heads * head_dimension */
-    float *key;                     /* n_kv_heads * head_dimension */
-    float *value;                   /* n_kv_heads * head_dimension */
+    float *normalized;              /* chunk * model dim */
+    float *query;                   /* chunk * n_heads * head_dimension */
+    float *key;                     /* chunk * n_kv_heads * head_dimension */
+    float *value;                   /* chunk * n_kv_heads * head_dimension */
     float *attention_probabilities; /* n_heads * max_context_tokens */
-    float *attention_output;        /* model dim */
-    float *ffn_gate;                /* hidden_dim */
-    float *ffn_up;                  /* hidden_dim */
-    float *matvec_output;           /* maximum of model dim, hidden_dim, vocab */
+    float *attention_output;        /* chunk * model dim */
+    float *ffn_gate;                /* chunk * hidden_dim */
+    float *ffn_up;                  /* chunk * hidden_dim */
+    float *matvec_output;           /* chunk * maximum of model dim, hidden_dim */
 } Qwen2InferenceState;
 
 /*

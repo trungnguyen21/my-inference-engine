@@ -37,4 +37,16 @@ int quantized_tensor_matvec_f32(
     int output_count
 );
 
+/* Multiply one packed matrix by token-major F32 vectors. Load each packed
+ * weight block into aligned local storage and apply it across the batch. inputs is
+ * [batch_count,input_count], outputs is [batch_count,output_count]. */
+int quantized_tensor_matmul_f32(
+    const GgufQuantizedTensorView *matrix,
+    const float *inputs,
+    int input_count,
+    int batch_count,
+    float *outputs,
+    int output_count
+);
+
 #endif

@@ -108,6 +108,15 @@ int engine_forward_token(const Model *model, InferenceState *state,
 int engine_forward_token_no_logits(const Model *model, InferenceState *state,
                                    int token_id, char *error, int error_capacity);
 
+/* Append count prompt IDs using the selected architecture's prefill callback.
+ * Require count > 0, a valid ID at every position, and sufficient context.
+ * On success, the last prompt token's logits are ready for sampling. An invalid
+ * request leaves state untouched; if processing fails, no new tokens are
+ * committed and logits_count is zero. Retry is permitted.
+ * A backend without prefill support returns an error. */
+int engine_prefill_tokens(const Model *model, InferenceState *state,
+                          const int *ids, int count, char *error, int error_capacity);
+
 /* Free all state-owned allocations and clear the caller's InferenceState. */
 void inference_state_destroy(InferenceState *state);
 

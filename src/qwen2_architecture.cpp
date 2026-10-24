@@ -299,11 +299,14 @@ static int qwen2_state_init(
     vocab = (size_t)config.vocab_size;
     kv_dim = (size_t)(config.dim / config.n_heads) * (size_t)config.n_kv_heads;
     max_projection = dim > hidden ? dim : hidden;
-    if (vocab > max_projection) max_projection = vocab;
     if (context > SIZE_MAX / dim || context * dim > SIZE_MAX / sizeof(float) ||
         context > SIZE_MAX / kv_dim || context * kv_dim > SIZE_MAX / sizeof(float) ||
         heads > SIZE_MAX / context || heads * context > SIZE_MAX / sizeof(float) ||
-        max_projection > SIZE_MAX / sizeof(float)) {
+        max_projection > SIZE_MAX / QWEN2_PREFILL_CHUNK_SIZE ||
+        max_projection * QWEN2_PREFILL_CHUNK_SIZE > SIZE_MAX / sizeof(float) ||
+        dim > SIZE_MAX / QWEN2_PREFILL_CHUNK_SIZE ||
+        hidden > SIZE_MAX / QWEN2_PREFILL_CHUNK_SIZE ||
+        kv_dim > SIZE_MAX / QWEN2_PREFILL_CHUNK_SIZE) {
         set_error(error, error_capacity, "Qwen2 inference-state allocation size overflows.");
         return 0;
     }
@@ -346,15 +349,15 @@ static int qwen2_state_init(
     ALLOC_FIELD(activations, context * dim, float);
     ALLOC_FIELD(keys, cache_count, float);
     ALLOC_FIELD(values, cache_count, float);
-    ALLOC_FIELD(normalized, dim, float);
-    ALLOC_FIELD(query, dim, float);
-    ALLOC_FIELD(key, kv_dim, float);
-    ALLOC_FIELD(value, kv_dim, float);
+    ALLOC_FIELD(normalized, QWEN2_PREFILL_CHUNK_SIZE * dim, float);
+    ALLOC_FIELD(query, QWEN2_PREFILL_CHUNK_SIZE * dim, float);
+    ALLOC_FIELD(key, QWEN2_PREFILL_CHUNK_SIZE * kv_dim, float);
+    ALLOC_FIELD(value, QWEN2_PREFILL_CHUNK_SIZE * kv_dim, float);
     ALLOC_FIELD(attention_probabilities, heads * context, float);
-    ALLOC_FIELD(attention_output, dim, float);
-    ALLOC_FIELD(ffn_gate, hidden, float);
-    ALLOC_FIELD(ffn_up, hidden, float);
-    ALLOC_FIELD(matvec_output, max_projection, float);
+    ALLOC_FIELD(attention_output, QWEN2_PREFILL_CHUNK_SIZE * dim, float);
+    ALLOC_FIELD(ffn_gate, QWEN2_PREFILL_CHUNK_SIZE * hidden, float);
+    ALLOC_FIELD(ffn_up, QWEN2_PREFILL_CHUNK_SIZE * hidden, float);
+    ALLOC_FIELD(matvec_output, QWEN2_PREFILL_CHUNK_SIZE * max_projection, float);
     state->logits = (float *)calloc(vocab, sizeof(float));
     if (state->logits == nullptr) goto allocation_failure;
     state->logits_count = config.vocab_size;
@@ -648,6 +651,84 @@ int qwen2_weight_matvec(
         }
         return 0;
     }
+    return 1;
+}
+
+static int qwen2_weight_matmul(
+    const GgufFile *file, const char *name, const float *inputs,
+    int input_count, int batch_count, float *outputs, int output_count,
+    char *error, int error_capacity)
+{
+    if (file == nullptr || name == nullptr || inputs == nullptr || outputs == nullptr ||
+        input_count <= 0 || output_count <= 0 || batch_count <= 0) {
+        set_error(error, error_capacity, "Qwen2 weight-matmul arguments are invalid.");
+        return 0;
+    }
+    const GgufTensorInfo *tensor = gguf_find_tensor(file, name);
+    if (!tensor_has_shape(tensor, (uint64_t)input_count, (uint64_t)output_count)) {
+        set_error(error, error_capacity, "Qwen2 batched weight has an invalid shape.");
+        return 0;
+    }
+    double *seconds = nullptr;
+    unsigned long long *calls = nullptr;
+    weight_profile_targets(tensor->type, name, &seconds, &calls);
+    int succeeded = 0;
+    {
+        OperationTimer timer(seconds != nullptr, seconds);
+        if (tensor->type == ENGINE_GGML_TYPE_F32) {
+            GgufF32TensorView view;
+            if (gguf_get_f32_tensor_view(file, name, &view))
+                succeeded = tensor_matmul_f32(view.data, output_count, input_count,
+                                              inputs, batch_count, outputs);
+        } else {
+            GgufQuantizedTensorView view;
+            if (gguf_get_quantized_tensor_view(file, name, &view))
+                succeeded = quantized_tensor_matmul_f32(&view, inputs, input_count,
+                                                        batch_count, outputs, output_count);
+        }
+    }
+    if (!succeeded) {
+        set_error(error, error_capacity, "Qwen2 batched matrix multiplication failed.");
+        return 0;
+    }
+    if (calls != nullptr) ++*calls;
+    return 1;
+}
+
+static int qwen2_layer_matmul(
+    const GgufFile *file, int layer, const char *suffix,
+    const float *inputs, int input_count, int batch_count,
+    float *outputs, int output_count, char *error, int error_capacity)
+{
+    char name[96];
+    if (layer < 0 || suffix == nullptr) return 0;
+    int length = snprintf(name, sizeof(name), "blk.%d.%s", layer, suffix);
+    if (length < 0 || (size_t)length >= sizeof(name)) {
+        set_error(error, error_capacity, "Qwen2 layer tensor name is too long.");
+        return 0;
+    }
+    return qwen2_weight_matmul(file, name, inputs, input_count, batch_count,
+                              outputs, output_count, error, error_capacity);
+}
+
+static int qwen2_layer_project_batch(
+    const GgufFile *file, int layer, const char *projection,
+    const float *inputs, int input_count, int batch_count,
+    float *outputs, int output_count, char *error, int error_capacity)
+{
+    char weight[80], bias_name[80];
+    GgufF32TensorView bias;
+    if (projection == nullptr) return 0;
+    int wl = snprintf(weight, sizeof(weight), "%s.weight", projection);
+    int bl = snprintf(bias_name, sizeof(bias_name), "%s.bias", projection);
+    if (wl < 0 || bl < 0 || (size_t)wl >= sizeof(weight) || (size_t)bl >= sizeof(bias_name) ||
+        !qwen2_layer_matmul(file, layer, weight, inputs, input_count, batch_count,
+                           outputs, output_count, error, error_capacity) ||
+        !qwen2_get_layer_vector(file, layer, bias_name, output_count,
+                                &bias, error, error_capacity)) return 0;
+    for (int batch = 0; batch < batch_count; ++batch)
+        for (int i = 0; i < output_count; ++i)
+            outputs[(size_t)batch * output_count + i] += bias.data[i];
     return 1;
 }
 
@@ -1463,6 +1544,190 @@ static int qwen2_forward_token_no_logits(const Model *model, InferenceState *sta
                                           error, error_capacity);
 }
 
+/* Layer-first chunked prefill. Packed blocks are decoded once per output row
+ * and reused across all activation vectors in the chunk. K/V retains the same
+ * [layer][absolute position][KV head][head dimension] layout as decode. */
+static int qwen2_prefill_tokens(const Model *model, InferenceState *state,
+                               const int *ids, int count, char *error, int error_capacity)
+{
+    if (model == nullptr || model->implementation == nullptr || state == nullptr ||
+        state->implementation == nullptr || state->logits == nullptr ||
+        ids == nullptr || count <= 0 || model->config.vocab_size <= 0) {
+        set_error(error, error_capacity, "Qwen2 prefill arguments are invalid.");
+        return 0;
+    }
+    Qwen2InferenceState *s = (Qwen2InferenceState *)state->implementation;
+    const EngineModel *implementation = (const EngineModel *)model->implementation;
+    const GgufFile *file = &implementation->gguf;
+    const int old_count = s->token_count;
+    const int dim = model->config.dim, hidden = model->config.hidden_dim;
+    const int kv_dim = s->key_value_dimension;
+    if (old_count < 0 || old_count > s->max_context_tokens ||
+        count > s->max_context_tokens - old_count) {
+        set_error(error, error_capacity, "Qwen2 prefill context capacity is exhausted.");
+        return 0;
+    }
+    for (int i = 0; i < count; ++i) {
+        if (ids[i] < 0 || ids[i] >= model->config.vocab_size) {
+            set_error(error, error_capacity, "Qwen2 prefill token ID is out of range.");
+            return 0;
+        }
+    }
+    /* The single-token NEON path is already the best decode-shaped kernel. */
+    if (count == 1)
+        return qwen2_forward_token_cached_impl(model, state, ids[0], true,
+                                               error, error_capacity);
+
+    OperationProfile *profile = &state->profile;
+    OperationTimer forward_timer(profile->enabled, &profile->forward_seconds);
+    WeightProfileScope weight_scope(profile);
+    const float *last_activation = nullptr;
+
+    for (int chunk_start = 0; chunk_start < count; chunk_start += QWEN2_PREFILL_CHUNK_SIZE) {
+        int batch = count - chunk_start;
+        if (batch > QWEN2_PREFILL_CHUNK_SIZE) batch = QWEN2_PREFILL_CHUNK_SIZE;
+        for (int b = 0; b < batch; ++b) {
+            if (!qwen2_lookup_embedding(file, ids[chunk_start + b], dim,
+                                        s->activations + (size_t)b * dim,
+                                        error, error_capacity)) goto failure;
+        }
+
+        for (int layer = 0; layer < model->config.n_layers; ++layer) {
+            GgufF32TensorView norm;
+            if (!qwen2_get_layer_vector(file, layer, "attn_norm.weight", dim,
+                                        &norm, error, error_capacity)) goto failure;
+            {
+                OperationTimer timer(profile->enabled, &profile->rmsnorm_seconds);
+                for (int b = 0; b < batch; ++b)
+                    if (!tensor_rms_norm_f32(s->activations + (size_t)b * dim, norm.data,
+                                             dim, model->config.rms_norm_epsilon,
+                                             s->normalized + (size_t)b * dim)) goto failure;
+            }
+            {
+                OperationTimer timer(profile->enabled, &profile->matvec_seconds);
+                if (!qwen2_layer_project_batch(file, layer, "attn_q", s->normalized, dim,
+                                               batch, s->query, dim, error, error_capacity) ||
+                    !qwen2_layer_project_batch(file, layer, "attn_k", s->normalized, dim,
+                                               batch, s->key, kv_dim, error, error_capacity) ||
+                    !qwen2_layer_project_batch(file, layer, "attn_v", s->normalized, dim,
+                                               batch, s->value, kv_dim, error, error_capacity))
+                    goto failure;
+            }
+            for (int b = 0; b < batch; ++b) {
+                int position = old_count + chunk_start + b;
+                {
+                    OperationTimer timer(profile->enabled, &profile->rope_seconds);
+                    if (!transformer_apply_rope_f32(
+                            s->query + (size_t)b * dim, model->config.n_heads,
+                            s->key + (size_t)b * kv_dim, model->config.n_kv_heads,
+                            s->head_dimension, s->head_dimension, position,
+                            model->config.rope_frequency_base)) goto failure;
+                }
+                Qwen2KvCacheLayerView cache;
+                if (!qwen2_kv_cache_layer_view(model, s, layer, position, &cache,
+                                               error, error_capacity)) goto failure;
+                memcpy(cache.key_slot, s->key + (size_t)b * kv_dim,
+                       (size_t)kv_dim * sizeof(float));
+                memcpy(cache.value_slot, s->value + (size_t)b * kv_dim,
+                       (size_t)kv_dim * sizeof(float));
+            }
+            /* Causality is expressed by position+1: later K/V slots have been
+             * written but are deliberately outside each query's visible prefix. */
+            for (int b = 0; b < batch; ++b) {
+                int position = old_count + chunk_start + b;
+                Qwen2KvCacheLayerView cache;
+                if (!qwen2_kv_cache_layer_view(model, s, layer, position, &cache,
+                                               error, error_capacity)) goto failure;
+                OperationTimer timer(profile->enabled, &profile->attention_seconds);
+                if (!transformer_attention_f32(
+                        s->query + (size_t)b * dim, model->config.n_heads,
+                        model->config.n_kv_heads, s->head_dimension,
+                        cache.keys, cache.values, position + 1,
+                        s->attention_probabilities,
+                        s->attention_output + (size_t)b * dim)) goto failure;
+            }
+            {
+                OperationTimer timer(profile->enabled, &profile->matvec_seconds);
+                if (!qwen2_layer_matmul(file, layer, "attn_output.weight",
+                                        s->attention_output, dim, batch,
+                                        s->matvec_output, dim, error, error_capacity)) goto failure;
+            }
+            for (int b = 0; b < batch; ++b)
+                for (int i = 0; i < dim; ++i)
+                    s->activations[(size_t)b * dim + i] += s->matvec_output[(size_t)b * dim + i];
+
+            if (!qwen2_get_layer_vector(file, layer, "ffn_norm.weight", dim,
+                                        &norm, error, error_capacity)) goto failure;
+            {
+                OperationTimer timer(profile->enabled, &profile->rmsnorm_seconds);
+                for (int b = 0; b < batch; ++b)
+                    if (!tensor_rms_norm_f32(s->activations + (size_t)b * dim, norm.data,
+                                             dim, model->config.rms_norm_epsilon,
+                                             s->normalized + (size_t)b * dim)) goto failure;
+            }
+            {
+                OperationTimer timer(profile->enabled, &profile->matvec_seconds);
+                if (!qwen2_layer_matmul(file, layer, "ffn_gate.weight", s->normalized,
+                                        dim, batch, s->ffn_gate, hidden, error, error_capacity) ||
+                    !qwen2_layer_matmul(file, layer, "ffn_up.weight", s->normalized,
+                                        dim, batch, s->ffn_up, hidden, error, error_capacity))
+                    goto failure;
+            }
+            for (int b = 0; b < batch; ++b)
+                if (!transformer_swiglu_f32(s->ffn_gate + (size_t)b * hidden,
+                                            s->ffn_up + (size_t)b * hidden, hidden)) goto failure;
+            {
+                OperationTimer timer(profile->enabled, &profile->matvec_seconds);
+                if (!qwen2_layer_matmul(file, layer, "ffn_down.weight", s->ffn_gate,
+                                        hidden, batch, s->matvec_output, dim,
+                                        error, error_capacity)) goto failure;
+            }
+            for (int b = 0; b < batch; ++b)
+                for (int i = 0; i < dim; ++i)
+                    s->activations[(size_t)b * dim + i] += s->matvec_output[(size_t)b * dim + i];
+        }
+        last_activation = s->activations + (size_t)(batch - 1) * dim;
+    }
+
+    {
+        GgufF32TensorView norm;
+        if (!gguf_get_f32_tensor_view(file, "output_norm.weight", &norm) ||
+            norm.dimension_count != 1 || norm.dimensions[0] != (uint64_t)dim) {
+            set_error(error, error_capacity, "Invalid output_norm.weight.");
+            goto failure;
+        }
+        {
+            OperationTimer timer(profile->enabled, &profile->rmsnorm_seconds);
+            if (!tensor_rms_norm_f32(last_activation, norm.data, dim,
+                                     model->config.rms_norm_epsilon, s->normalized)) goto failure;
+        }
+        {
+            OperationTimer timer(profile->enabled, &profile->output_seconds);
+            if (!qwen2_weight_matvec(file, "output.weight", s->normalized, dim,
+                                     state->logits, model->config.vocab_size,
+                                     error, error_capacity)) goto failure;
+        }
+    }
+    for (int i = 0; i < model->config.vocab_size; ++i)
+        if (!isfinite(state->logits[i])) {
+            set_error(error, error_capacity, "Output contains a non-finite logit.");
+            goto failure;
+        }
+    memcpy(s->token_ids + old_count, ids, (size_t)count * sizeof(int));
+    s->token_count = old_count + count;
+    state->logits_count = model->config.vocab_size;
+    if (profile->enabled) profile->forward_calls += (unsigned long long)count;
+    if (error != nullptr && error_capacity > 0) error[0] = '\0';
+    return 1;
+
+failure:
+    s->token_count = old_count;
+    state->logits_count = 0;
+    if (error != nullptr && error_capacity > 0 && error[0] == '\0')
+        set_error(error, error_capacity, "Qwen2 batched prefill failed.");
+    return 0;
+}
+
 static void qwen2_state_destroy(InferenceState *state)
 {
     Qwen2InferenceState *private_state;
@@ -1538,7 +1803,8 @@ const ArchitectureOps *qwen2_architecture_ops(void)
         qwen2_forward_token_cached,
         qwen2_state_destroy,
         qwen2_format_prompt,
-        qwen2_forward_token_no_logits
+        qwen2_forward_token_no_logits,
+        qwen2_prefill_tokens
     };
 
     return &ops;

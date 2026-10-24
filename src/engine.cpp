@@ -226,6 +226,34 @@ int engine_forward_token_no_logits(const Model *model, InferenceState *state,
         model, state, token_id, error, error_capacity);
 }
 
+int engine_prefill_tokens(const Model *model, InferenceState *state,
+                          const int *ids, int count, char *error, int error_capacity)
+{
+    if (model == nullptr || model->implementation == nullptr ||
+        state == nullptr || state->implementation == nullptr || ids == nullptr ||
+        count <= 0 || model->config.vocab_size <= 0) {
+        set_error(error, error_capacity, "Prefill arguments are invalid.");
+        return 0;
+    }
+    const EngineModel *implementation = (const EngineModel *)model->implementation;
+    const EngineStateHeader *state_header = (const EngineStateHeader *)state->implementation;
+    if (implementation->architecture == nullptr ||
+        implementation->architecture->prefill_tokens == nullptr ||
+        state_header->architecture != implementation->architecture) {
+        set_error(error, error_capacity,
+                  "Model and inference state do not support batched prefill.");
+        return 0;
+    }
+    for (int i = 0; i < count; ++i) {
+        if (ids[i] < 0 || ids[i] >= model->config.vocab_size) {
+            set_error(error, error_capacity, "Prefill token ID is out of range.");
+            return 0;
+        }
+    }
+    return implementation->architecture->prefill_tokens(
+        model, state, ids, count, error, error_capacity);
+}
+
 void inference_state_destroy(InferenceState *state)
 {
     EngineStateHeader *state_header;

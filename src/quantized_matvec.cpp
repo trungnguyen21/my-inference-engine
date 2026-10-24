@@ -160,3 +160,65 @@ int quantized_tensor_matvec_f32(
     }
     return !failed;
 }
+
+int quantized_tensor_matmul_f32(
+    const GgufQuantizedTensorView *matrix, const float *inputs,
+    int input_count, int batch_count, float *outputs, int output_count)
+{
+    if (matrix == nullptr || matrix->data == nullptr || inputs == nullptr ||
+        outputs == nullptr || input_count <= 0 || output_count <= 0 || batch_count <= 0 ||
+        matrix->dimension_count != 2) return 0;
+    uint64_t columns = matrix->dimensions[0], rows = matrix->dimensions[1];
+    if (columns == 0 || rows == 0 || columns > INT_MAX || rows > INT_MAX ||
+        input_count != (int)columns || output_count != (int)rows ||
+        (size_t)batch_count > SIZE_MAX / (size_t)input_count ||
+        (size_t)batch_count > SIZE_MAX / (size_t)output_count) return 0;
+
+    uint64_t block_elements = 0, block_bytes = 0;
+    switch (matrix->ggml_type) {
+        case ENGINE_GGML_TYPE_Q5_0: block_elements = Q5_0_BLOCK_ELEMENTS; block_bytes = Q5_0_BLOCK_BYTES; break;
+        case ENGINE_GGML_TYPE_Q8_0: block_elements = Q8_0_BLOCK_ELEMENTS; block_bytes = Q8_0_BLOCK_BYTES; break;
+        case ENGINE_GGML_TYPE_Q4_K: block_elements = Q4_K_BLOCK_ELEMENTS; block_bytes = Q4_K_BLOCK_BYTES; break;
+        case ENGINE_GGML_TYPE_Q6_K: block_elements = Q6_K_BLOCK_ELEMENTS; block_bytes = Q6_K_BLOCK_BYTES; break;
+        default: return 0;
+    }
+    if (matrix->block_elements != block_elements || matrix->block_bytes != block_bytes ||
+        columns % block_elements != 0) return 0;
+    uint64_t blocks_per_row = columns / block_elements;
+    if (blocks_per_row > UINT64_MAX / rows ||
+        matrix->block_count != blocks_per_row * rows ||
+        columns > UINT64_MAX / rows || matrix->element_count != columns * rows ||
+        matrix->block_count > SIZE_MAX / block_bytes) return 0;
+
+    int failed = 0;
+#ifdef _OPENMP
+#pragma omp parallel for schedule(static) reduction(|:failed)
+#endif
+    for (int row = 0; row < output_count; ++row) {
+        for (int batch = 0; batch < batch_count; ++batch)
+            outputs[(size_t)batch * output_count + row] = 0.0f;
+        for (uint64_t block = 0; block < blocks_per_row; ++block) {
+            uint64_t packed_index = (uint64_t)row * blocks_per_row + block;
+            const unsigned char *address = matrix->data + packed_index * block_bytes;
+#define ACCUMULATE_BATCH(BlockType, dot_fn) do { \
+                BlockType local; memcpy(&local, address, sizeof(local)); \
+                for (int batch = 0; batch < batch_count; ++batch) { \
+                    const float *input = inputs + (size_t)batch * input_count + block * block_elements; \
+                    float partial = 0.0f; \
+                    if (!dot_fn(&local, input, &partial)) { failed = 1; break; } \
+                    outputs[(size_t)batch * output_count + row] += partial; \
+                } \
+            } while (0)
+            switch (matrix->ggml_type) {
+                case ENGINE_GGML_TYPE_Q5_0: ACCUMULATE_BATCH(Q5_0Block, q5_0_dot_f32); break;
+                case ENGINE_GGML_TYPE_Q8_0: ACCUMULATE_BATCH(Q8_0Block, q8_0_dot_f32); break;
+                case ENGINE_GGML_TYPE_Q4_K: ACCUMULATE_BATCH(Q4_KBlock, q4_k_dot_f32); break;
+                case ENGINE_GGML_TYPE_Q6_K: ACCUMULATE_BATCH(Q6_KBlock, q6_k_dot_f32); break;
+                default: failed = 1; break;
+            }
+#undef ACCUMULATE_BATCH
+            if (failed) break;
+        }
+    }
+    return !failed;
+}

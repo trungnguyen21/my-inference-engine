@@ -38,9 +38,11 @@ how this layout reduces the K/V storage needed compared with multi-head attentio
 
 The animation shows prompt prefill followed by token-by-token decoding with
 a persistent KV cache. The current backend uses a persistent per-layer KV cache during token-by-token
-inference. A separate batched, one-pass prefill is not yet implemented; see the
-[optimization roadmap](docs/optimization-roadmap.md) for historical context
-and further proposed changes.
+inference. Prompt prefill uses bounded layer-first chunks, batched weight
+projections, causal per-position attention, and the same persistent K/V cache;
+see the [batched prefill implementation plan](docs/batched-prefill-implementation-plan.md)
+for its stages, risks, and tests, or the
+[optimization roadmap](docs/optimization-roadmap.md) for historical context.
 
 ![Animation of prompt prefill and autoregressive decoding with a growing KV cache](media/prefill_decode_kv_cache.gif)
 
@@ -77,9 +79,10 @@ change floating-point rounding; see the [beginner's NEON guide](docs/quantized-n
 
 Use `--temperature 0` for the implemented greedy sampler. The CLI default
 is still `0.8`; nonzero-temperature/top-p sampling reports a clear unsupported
-error until that later feature is implemented. Prefill currently processes prompt
-tokens individually, but skips the final normalization and vocabulary projection
-for every prompt token except the last. Batched prefill is not yet implemented.
+error until that later feature is implemented. The app submits prompt tokens
+through a checked prefill API. Qwen2 batches up to eight positions through each
+layer and computes the final normalization and vocabulary projection only for
+the last prompt token. Generation remains single-token cached decode.
 
 The CLI accepts `--max-tokens`, `--temperature`, and `--top-p`; run with
 `--help` to see defaults and accepted values. `src/app.cpp` contains a separate
@@ -146,7 +149,7 @@ Add `--profile` to collect and print an operation breakdown after generation:
   --max-tokens 16 --temperature 0 --top-p 1 --profile
 ```
 
-The report shows accumulated milliseconds and percentages for layer matvecs
+The report shows accumulated milliseconds and percentages for layer projections
 (Q/K/V, attention output, and FFN projections), attention scores/softmax/value
 aggregation, RMSNorm, RoPE, and the output matrix plus sampling. Output projection
 time is excluded from the layer matvec row. Projection timings include weight
@@ -154,10 +157,12 @@ lookup, storage dispatch, and Q/K/V bias addition. A second table reports the
 actual F32/Q5_0/Q8_0/Q4_K/Q6_K weight-kernel wall time and call count, with
 layer and output projections separated. Its shares are percentages of timed
 weight kernels only; these times are already included in the operation rows,
-not additional time. Both tables combine prefill and decode.
+not additional time. A prefill batched-kernel call covers several positions, so
+call counts are not directly comparable with the older per-token path. Both
+tables combine prefill and decode.
 
-Totals cover **prompt prefill and generation**, including cached forward
-calls for each prompt and generated token, across all forward and sampling calls. Percentages use total
+Totals cover **prompt prefill and generation**, including chunked prefill and
+cached generated-token forwards, across all forward and sampling calls. Percentages use total
 forward time plus sampling time; an **other forward work** row accounts for
 embeddings, SwiGLU, residual additions, copies, validation, and instrumentation
 overhead. Loading, tokenization, and terminal output are excluded. These totals

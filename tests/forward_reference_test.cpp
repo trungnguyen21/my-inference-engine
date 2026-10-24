@@ -311,6 +311,84 @@ static void test_prefill_skips_unused_logits_but_preserves_final_result(void)
     inference_state_destroy(&prefill);
 }
 
+static void test_prefill_api_rollback_and_decode_parity(void)
+{
+    ForwardFixture fixture;
+    InferenceState baseline = {}, batch = {};
+    char error[ENGINE_ERROR_CAPACITY] = {};
+    const int ids[] = {0, 1};
+    const int bad_ids[] = {0, -1};
+    initialize_fixture(&fixture);
+    assert(inference_state_init(&fixture.model, &baseline, 3, error, sizeof(error)) == 1);
+    assert(inference_state_init(&fixture.model, &batch, 3, error, sizeof(error)) == 1);
+    batch.profile.enabled = 1;
+    assert(engine_prefill_tokens(&fixture.model, &batch, nullptr, 2,
+                                 error, sizeof(error)) == 0);
+    assert(engine_prefill_tokens(&fixture.model, &batch, bad_ids, 2,
+                                 error, sizeof(error)) == 0);
+    assert(engine_prefill_tokens(&fixture.model, &batch, ids, 0,
+                                 error, sizeof(error)) == 0);
+    assert(((Qwen2InferenceState *)batch.implementation)->token_count == 0);
+    GgufTensorInfo *output = (GgufTensorInfo *)gguf_find_tensor(
+        &fixture.implementation.gguf, "output.weight");
+    assert(output != nullptr);
+    --output->dimensions[0]; /* Fail after computing the first token's K/V. */
+    assert(engine_prefill_tokens(&fixture.model, &batch, ids, 2,
+                                 error, sizeof(error)) == 0);
+    assert(((Qwen2InferenceState *)batch.implementation)->token_count == 0);
+    assert(batch.logits_count == 0);
+    ++output->dimensions[0];
+    assert(engine_prefill_tokens(&fixture.model, &batch, ids, 2,
+                                 error, sizeof(error)) == 1);
+    assert(batch.profile.weight_output_calls[PROFILE_F32] == 1);
+    assert(engine_forward_token(&fixture.model, &baseline, 0, error, sizeof(error)) == 1);
+    assert(engine_forward_token(&fixture.model, &baseline, 1, error, sizeof(error)) == 1);
+    for (int id = 0; id < FIXTURE_VOCAB_SIZE; ++id) {
+        assert(floats_nearly_equal(batch.logits[id], baseline.logits[id]));
+    }
+    const Qwen2InferenceState *a = (const Qwen2InferenceState *)batch.implementation;
+    const Qwen2InferenceState *b = (const Qwen2InferenceState *)baseline.implementation;
+    size_t cache_bytes = (size_t)fixture.model.config.n_layers * 3 *
+                         (size_t)(fixture.model.config.n_kv_heads * a->head_dimension) * sizeof(float);
+    assert(memcmp(a->keys, b->keys, cache_bytes) == 0);
+    assert(memcmp(a->values, b->values, cache_bytes) == 0);
+    assert(engine_forward_token(&fixture.model, &batch, 2, error, sizeof(error)) == 1);
+    assert(engine_forward_token(&fixture.model, &baseline, 2, error, sizeof(error)) == 1);
+    for (int id = 0; id < FIXTURE_VOCAB_SIZE; ++id) {
+        assert(floats_nearly_equal(batch.logits[id], baseline.logits[id]));
+    }
+    inference_state_destroy(&baseline);
+    inference_state_destroy(&batch);
+}
+
+static void test_prefill_crosses_chunk_boundary(void)
+{
+    ForwardFixture fixture;
+    InferenceState sequential = {}, batched = {};
+    char error[ENGINE_ERROR_CAPACITY] = {};
+    int ids[QWEN2_PREFILL_CHUNK_SIZE + 1];
+    for (int i = 0; i < QWEN2_PREFILL_CHUNK_SIZE + 1; ++i) ids[i] = i % FIXTURE_VOCAB_SIZE;
+    initialize_fixture(&fixture);
+    fixture.model.config.seq_len = QWEN2_PREFILL_CHUNK_SIZE + 2;
+    assert(inference_state_init(&fixture.model, &sequential, QWEN2_PREFILL_CHUNK_SIZE + 2,
+                                error, sizeof(error)) == 1);
+    assert(inference_state_init(&fixture.model, &batched, QWEN2_PREFILL_CHUNK_SIZE + 2,
+                                error, sizeof(error)) == 1);
+    for (int id : ids)
+        assert(engine_forward_token(&fixture.model, &sequential, id, error, sizeof(error)) == 1);
+    assert(engine_prefill_tokens(&fixture.model, &batched, ids,
+                                 QWEN2_PREFILL_CHUNK_SIZE + 1,
+                                 error, sizeof(error)) == 1);
+    for (int id = 0; id < FIXTURE_VOCAB_SIZE; ++id)
+        assert(floats_nearly_equal(batched.logits[id], sequential.logits[id]));
+    assert(engine_forward_token(&fixture.model, &sequential, 1, error, sizeof(error)) == 1);
+    assert(engine_forward_token(&fixture.model, &batched, 1, error, sizeof(error)) == 1);
+    for (int id = 0; id < FIXTURE_VOCAB_SIZE; ++id)
+        assert(floats_nearly_equal(batched.logits[id], sequential.logits[id]));
+    inference_state_destroy(&sequential);
+    inference_state_destroy(&batched);
+}
+
 static void test_forward_rejects_invalid_token_and_exhausted_context(void)
 {
     ForwardFixture fixture;
@@ -371,6 +449,8 @@ int main(void)
     test_two_token_full_prefix_forward();
     test_cached_forward_matches_full_prefix_after_each_token();
     test_prefill_skips_unused_logits_but_preserves_final_result();
+    test_prefill_api_rollback_and_decode_parity();
+    test_prefill_crosses_chunk_boundary();
     test_forward_rejects_invalid_token_and_exhausted_context();
     test_attention_failure_reports_error_and_allows_retry();
 

@@ -1,4 +1,5 @@
 #include <math.h>
+#include <stddef.h>
 #include "tensor.h"
 
 int tensor_add_f32(
@@ -66,6 +67,31 @@ int tensor_matvec_f32(
             row_sum += matrix[i * columns + j] * input[j];
         }
         output[i] = row_sum;
+    }
+    return 1;
+}
+
+int tensor_matmul_f32(
+    const float *matrix, int rows, int columns,
+    const float *inputs, int batch_count, float *outputs
+) {
+    if (matrix == nullptr || inputs == nullptr || outputs == nullptr ||
+        rows <= 0 || columns <= 0 || batch_count <= 0) {
+        return 0;
+    }
+#ifdef _OPENMP
+#pragma omp parallel for schedule(static)
+#endif
+    for (int row = 0; row < rows; ++row) {
+        const float *weights = matrix + (size_t)row * columns;
+        for (int batch = 0; batch < batch_count; ++batch) {
+            const float *input = inputs + (size_t)batch * columns;
+            float sum = 0.0f;
+            for (int column = 0; column < columns; ++column) {
+                sum += weights[column] * input[column];
+            }
+            outputs[(size_t)batch * rows + row] = sum;
+        }
     }
     return 1;
 }

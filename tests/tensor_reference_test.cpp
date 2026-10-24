@@ -71,6 +71,16 @@ static void test_matrix_vector_product(void)
     assert(arrays_nearly_equal(output, expected, 2));
 }
 
+static void test_matrix_batch_product(void)
+{
+    const float matrix[] = {1, 2, 3, 4, 5, 6};
+    const float inputs[] = {1, 0, -1, 2, 1, 0};
+    const float expected[] = {-2, -2, 4, 13};
+    float outputs[4] = {};
+    assert(tensor_matmul_f32(matrix, 2, 3, inputs, 2, outputs) == 1);
+    assert(arrays_nearly_equal(outputs, expected, 4));
+}
+
 static void test_rms_norm(void)
 {
     const float input[] = {1.0f, 1.0f};
@@ -139,6 +149,7 @@ static void test_invalid_arguments(void)
     assert(tensor_matvec_f32(nullptr, 2, 2, values, output) == 0);
     assert(tensor_matvec_f32(matrix, 0, 2, values, output) == 0);
     assert(tensor_matvec_f32(matrix, 2, -1, values, output) == 0);
+    assert(tensor_matmul_f32(matrix, 2, 2, values, 0, output) == 0);
 
     assert(tensor_rms_norm_f32(nullptr, values, 3, 0.00001f, output) == 0);
     assert(tensor_rms_norm_f32(values, nullptr, 3, 0.00001f, output) == 0);
@@ -159,6 +170,7 @@ int main(void)
     test_dot_product_decimals();
     test_vector_add();
     test_matrix_vector_product();
+    test_matrix_batch_product();
     test_rms_norm();
     test_silu();
     test_vector_multiply();

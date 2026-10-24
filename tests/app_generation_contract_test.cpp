@@ -24,7 +24,7 @@ static std::vector<std::string> events;
 static std::string printed, reported_error;
 static int loaded, unloaded, initialized, destroyed, finished, sampled, captured;
 static int reported_tokens, requested_capacity;
-static int profiles_printed;
+static int profiles_printed, prefill_calls;
 static double reported_elapsed, reported_first_token;
 static int unavailable_capture;
 static bool empty_first_piece;
@@ -39,7 +39,7 @@ static void reset(Failure selected, const std::vector<int> &script)
     printed.clear(); reported_error.clear();
     loaded = unloaded = initialized = destroyed = finished = sampled = captured = 0;
     reported_tokens = requested_capacity = 0;
-    profiles_printed = 0;
+    profiles_printed = prefill_calls = 0;
     reported_elapsed = reported_first_token = -1.0;
     unavailable_capture = 0;
     empty_first_piece = false;
@@ -137,6 +137,20 @@ int engine_forward_token_no_logits(const Model *model, InferenceState *state, in
     return 1;
 }
 
+int engine_prefill_tokens(const Model *model, InferenceState *state,
+                          const int *ids, int count, char *error, int capacity)
+{
+    ++prefill_calls;
+    assert(ids != nullptr && count == 2);
+    for (int i = 0; i < count; ++i) {
+        int success = i + 1 == count
+            ? engine_forward_token(model, state, ids[i], error, capacity)
+            : engine_forward_token_no_logits(model, state, ids[i], error, capacity);
+        if (!success) return 0;
+    }
+    return 1;
+}
+
 int sampler_sample(const float *scores, int count, float temperature, float top_p,
                    int *id, char *error, int capacity)
 {
@@ -214,6 +228,7 @@ static void expect_success(int limit, const std::vector<int> &script,
     assert(app_run(&config) == 0);
     assert(forwards == expected_forwards && printed == text);
     assert(skipped_logits == std::vector<int>(1, 1)); /* Only first prompt token. */
+    assert(prefill_calls == 1);
     assert(loaded == 1 && unloaded == 1 && initialized == 1 && destroyed == 1);
     assert(finished == 1 && reported_tokens == count && sampled == count);
     const bool has_text = text[0] != '\0';
