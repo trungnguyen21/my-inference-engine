@@ -2,7 +2,7 @@
 
 #include "qwen2_internal.h"
 #include "quantization.h"
-#include "quantized_matvec.h"
+#include "matrix_backend.h"
 #include "operation_timer.h"
 #include "tensor.h"
 #include "transformer_ops.h"
@@ -576,6 +576,7 @@ int qwen2_weight_matvec(
 )
 {
     GgufF32TensorView view;
+    const MatrixBackend *backend = matrix_backend_default();
 
     if (file == nullptr || name == nullptr || input == nullptr ||
         output == nullptr || input_count <= 0 || output_count <= 0 || input == output) {
@@ -602,14 +603,14 @@ int qwen2_weight_matvec(
         int succeeded;
         if (active_weight_profile == nullptr) {
             // No clock reads or per-format bookkeeping on the unprofiled path.
-            succeeded = quantized_tensor_matvec_f32(&packed, input, input_count, output, output_count);
+            succeeded = matrix_backend_matvec_quantized(backend, &packed, input, input_count, output, output_count);
         } else {
             double *seconds;
             unsigned long long *calls;
             weight_profile_targets(tensor->type, name, &seconds, &calls);
             {
                 OperationTimer timer(seconds != nullptr, seconds);
-                succeeded = quantized_tensor_matvec_f32(&packed, input, input_count, output, output_count);
+                succeeded = matrix_backend_matvec_quantized(backend, &packed, input, input_count, output, output_count);
             }
             if (succeeded && calls != nullptr) ++*calls;
         }
@@ -633,14 +634,14 @@ int qwen2_weight_matvec(
     }
     int succeeded;
     if (active_weight_profile == nullptr) {
-        succeeded = tensor_matvec_f32(view.data, output_count, input_count, input, output);
+        succeeded = matrix_backend_matvec_f32(backend, view.data, output_count, input_count, input, output);
     } else {
         double *seconds;
         unsigned long long *calls;
         weight_profile_targets(tensor->type, name, &seconds, &calls);
         {
             OperationTimer timer(seconds != nullptr, seconds);
-            succeeded = tensor_matvec_f32(view.data, output_count, input_count, input, output);
+            succeeded = matrix_backend_matvec_f32(backend, view.data, output_count, input_count, input, output);
         }
         if (succeeded && calls != nullptr) ++*calls;
     }
@@ -669,6 +670,7 @@ static int qwen2_weight_matmul(
         set_error(error, error_capacity, "Qwen2 batched weight has an invalid shape.");
         return 0;
     }
+    const MatrixBackend *backend = matrix_backend_default();
     double *seconds = nullptr;
     unsigned long long *calls = nullptr;
     weight_profile_targets(tensor->type, name, &seconds, &calls);
@@ -678,13 +680,13 @@ static int qwen2_weight_matmul(
         if (tensor->type == ENGINE_GGML_TYPE_F32) {
             GgufF32TensorView view;
             if (gguf_get_f32_tensor_view(file, name, &view))
-                succeeded = tensor_matmul_f32(view.data, output_count, input_count,
-                                              inputs, batch_count, outputs);
+                succeeded = matrix_backend_matmul_f32(backend, view.data, output_count, input_count,
+                                                      inputs, batch_count, outputs);
         } else {
             GgufQuantizedTensorView view;
             if (gguf_get_quantized_tensor_view(file, name, &view))
-                succeeded = quantized_tensor_matmul_f32(&view, inputs, input_count,
-                                                        batch_count, outputs, output_count);
+                succeeded = matrix_backend_matmul_quantized(backend, &view, inputs, input_count,
+                                                            batch_count, outputs, output_count);
         }
     }
     if (!succeeded) {

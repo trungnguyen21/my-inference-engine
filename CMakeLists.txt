@@ -44,6 +44,13 @@ FetchContent_Declare(
 )
 FetchContent_MakeAvailable(llama_cpp)
 
+# Backend-neutral matrix API plus its CPU implementation and empty GPU stub.
+set(ENGINE_MATRIX_BACKEND_SOURCES
+    src/matrix_backend.cpp
+    src/matrix_backend_cpu.cpp
+    src/matrix_backend_gpu.cpp
+)
+
 add_executable(inference
     src/main.cpp
     src/app.cpp
@@ -55,6 +62,7 @@ add_executable(inference
     src/tensor.cpp
     src/quantization.cpp
     src/quantized_matvec.cpp
+    ${ENGINE_MATRIX_BACKEND_SOURCES}
     src/tokenizer.cpp
     src/gguf_reader.cpp
     src/metrics.cpp
@@ -286,6 +294,22 @@ if(BUILD_TESTING)
     endif()
     add_test(NAME quantized_matvec_failure_test COMMAND quantized_matvec_failure_test)
 
+    # Backend-neutral matrix API: CPU parity with the kernels and an unavailable GPU stub.
+    add_executable(matrix_backend_test
+        tests/matrix_backend_test.cpp
+        ${ENGINE_MATRIX_BACKEND_SOURCES}
+        src/tensor.cpp
+        src/quantized_matvec.cpp
+        src/quantization.cpp
+    )
+    target_include_directories(matrix_backend_test PRIVATE include src)
+    if(MSVC)
+        target_compile_options(matrix_backend_test PRIVATE /W4 /UNDEBUG)
+    else()
+        target_compile_options(matrix_backend_test PRIVATE -Wall -Wextra -Wpedantic -UNDEBUG)
+    endif()
+    add_test(NAME matrix_backend_test COMMAND matrix_backend_test)
+
     # This reference test covers the completed local numerical helpers used by
     # the Milestone 06 transformer forward path.
     add_executable(transformer_ops_reference_test
@@ -317,6 +341,7 @@ if(BUILD_TESTING)
         src/transformer_ops.cpp
         src/quantization.cpp
         src/quantized_matvec.cpp
+        ${ENGINE_MATRIX_BACKEND_SOURCES}
         src/sampler.cpp
         src/tokenizer.cpp
         src/gguf_reader.cpp
@@ -352,6 +377,7 @@ if(BUILD_TESTING)
         src/gguf_reader.cpp
         src/quantization.cpp
         src/quantized_matvec.cpp
+        ${ENGINE_MATRIX_BACKEND_SOURCES}
     )
 
     target_include_directories(forward_reference_test PRIVATE include src)
@@ -382,6 +408,7 @@ if(BUILD_TESTING)
             src/transformer_ops.cpp
             src/quantization.cpp
             src/quantized_matvec.cpp
+            ${ENGINE_MATRIX_BACKEND_SOURCES}
         )
         target_include_directories(${checkpoint} PRIVATE include src)
         if(APPLE OR CMAKE_SYSTEM_NAME STREQUAL "Linux")
@@ -460,6 +487,7 @@ if(ENGINE_OPENMP)
         tensor_reference_test
         quantized_matvec_reference_test
         quantized_matvec_failure_test
+        matrix_backend_test
         transformer_ops_reference_test
         inference_state_contract_test
         forward_reference_test

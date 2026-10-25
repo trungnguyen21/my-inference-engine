@@ -123,6 +123,18 @@ The real-model acceptance executables and CLI smoke test have been removed.
 Older milestone documents retain historical evidence of their results; use
 the commands above for the current automated suite.
 
+### Matrix backends
+
+Qwen2 projections go through the backend-neutral API in `src/matrix_backend.h`
+(`matrix_backend_matvec_f32`, `matrix_backend_matmul_f32`, and the packed
+`..._quantized` equivalents). `matrix_backend_default()` currently returns the CPU
+backend (`src/matrix_backend_cpu.cpp`), which delegates to the existing OpenMP/NEON
+kernels. `src/matrix_backend_gpu.cpp` is an intentionally empty, unavailable
+placeholder: its descriptor has `available = 0` and null operations, so every
+checked call fails without touching the output. A future Metal backend fills in
+those function pointers; selecting it is a one-line change in
+`matrix_backend_default()`.
+
 ### Quantized matvec microbenchmark
 
 To compare the four packed formats with the same synthetic matrix dimensions:

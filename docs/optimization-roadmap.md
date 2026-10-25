@@ -1,14 +1,11 @@
-'''''''''''''# Inference Optimization Roadmap
+# Inference Optimization Roadmap
 
-Prepared for review on 2026-10-16, after the first successful real-model text
-generation. These are proposed changes, ranked from small local edits to major
-backend and scheduling work. The ranking considers implementation difficulty,
-correctness risk, and how much of this project must change.
-
-**The largest structural opportunities are one-pass prefill and a persistent
-KV cache.** They appear below several smaller changes because they are more
-involved. Expected benefits are estimates from reading the code, not measured
-speedups. A profiler may change the order within each difficulty group.
+This is now a living implementation-status document rather than only a list of
+proposals. The engine has crossed several of the original structural milestones:
+persistent per-layer K/V caching, ARM NEON packed kernels, OpenMP row
+parallelism, skipped intermediate prompt logits, and bounded batched prefill.
+Items still need controlled cold/warm benchmarks before their speedups should be
+claimed. The remaining rankings describe likely next work, not a fixed order.
 
 ## Current baseline
 
@@ -17,35 +14,50 @@ weights, F32 activations, and greedy sampling. The local model uses 24 layers,
 896 model dimensions, 4,864 FFN dimensions, 14 query heads, 2 KV heads, and
 64 dimensions per head. These values are recorded in [PROJECT_GUIDE.md](../PROJECT_GUIDE.md).
 
-The complete real CLI smoke test took **729.23 seconds**, producing
-`The capital of France is Paris.` That is a previous correctness-test duration,
-not an isolated, repeated performance benchmark or a profile of individual
-functions. All 23 checks passed with the local model configured.
+The old 729.23-second first-generation smoke test is historical and no longer
+describes the active execution path. The current implementation has:
 
-Code observations that motivate this list:
+- a checked `engine_prefill_tokens` API and Qwen2 layer-first chunks of up to
+  eight prompt positions;
+- batched F32 and packed Q5_0/Q8_0/Q4_K/Q6_K weight projections during prefill;
+- per-position RoPE, causal attention, and K/V writes to the same persistent
+  cache consumed by decode;
+- single-token cached decode, with the retained full-prefix implementation used
+  as a small-fixture correctness reference;
+- ARM64 NEON packed block-dot kernels with scalar fallbacks, plus OpenMP over
+  independent matrix rows;
+- native ARM FP16-to-F32 scale conversion with a portable bit-expansion fallback;
+- operation and per-weight-format profiling, a standalone packed-matvec
+  benchmark, time-to-first-token reporting, generation throughput, CPU use, and
+  resident-memory reporting. The current automated suite has 22 checks; real
+  GGUF runs remain a manual acceptance step.
 
-- [app.cpp](../src/app.cpp) forwards every prompt token separately.
-- [qwen2_forward_token](../src/qwen2_architecture.cpp) rebuilds embeddings and
-  every layer's activations for the entire prefix on every call. The plural
-  `keys` and `values` arrays are reused as temporary workspace for each layer;
-  they are not a persistent cache for all layers.
-- [quantization.cpp](../src/quantization.cpp) converts F16 block scales with
-  arithmetic including `powf` and `ldexpf`, repeatedly during packed products.
-- [transformer_ops.cpp](../src/transformer_ops.cpp) computes RoPE powers and
-  trigonometric values inside head loops. Attention computes its scale inside
-  the token-score loop.
-- [gguf_find_tensor](../src/gguf_reader.cpp) scans tensor names linearly. The
-  forward helpers repeatedly format names, look up tensors, and construct views.
-- The current local build is already **Release with `-O3`**. Enabling Release
-  is a baseline check, not an unimplemented optimization here.
-- The app starts its displayed generation timer **after prefill**. Its current
-  tokens/s figure does not describe the wait for the first output token.
+Current observations that still motivate work:
 
-## Before optimizing: make the measurements useful
+- layer projections and the vocabulary output projection dominate measured CPU
+  time; scalar attention has been a small share on tested short contexts;
+- [gguf_find_tensor](../src/gguf_reader.cpp) still scans tensor names linearly,
+  and forward helpers still format names and reconstruct validated views;
+- RoPE still computes powers and trigonometric values in the forward path;
+- batched prefill reuses one aligned packed block across a chunk but invokes the
+  existing format dot operation for each activation; further block-level batch
+  reuse is possible only if measurement justifies the extra kernel complexity;
+- the local build is already Release with `-O3`; four OpenMP workers performed
+  best in the initial M2 thread-count experiment, but controlled repeated
+  benchmarks remain necessary.
 
-Add or collect separate timings for model/tokenizer loading, prompt formatting
-and tokenization, prefill, first output, and later token forwards. Record
-formatted prompt token count, generated token count, EOS behavior, and memory
+## Measurement status and remaining gaps
+
+The CLI now reports time to first emitted token separately from generation-only
+tokens/s, CPU use, and resident RAM. `--profile` reports operation stages and
+F32/Q5_0/Q8_0/Q4_K/Q6_K kernel time/calls. The standalone packed benchmark is
+useful for before/after kernel comparisons. Profiling still combines prefill and
+decode, and a batched prefill call represents multiple positions, so its call
+counts cannot be compared directly with the older per-token path.
+
+Still add or collect separate timings for model/tokenizer loading, prompt
+formatting and tokenization, prefill, first output, and later token forwards.
+Record formatted prompt token count, generated token count, EOS behavior, and memory
 alongside the timing. Time to first token should mean the first actual generated
 piece, not the immediately printed `Output:` heading.
 
@@ -67,42 +79,43 @@ changes affect several helpers or ownership; **large** changes affect state,
 numerical kernels, or parallel execution; **very large** changes add a backend
 or a request scheduler. Items at similar difficulty can be reordered after profiling.
 
-| Rank | Proposed optimization | Difficulty | Main benefit | Expected return here |
+| Rank | Optimization | Status | Difficulty | Main benefit / next decision |
 | --- | --- | --- | --- | --- |
-| 1 | Replace arithmetic F16 scale conversion | Small | Cheaper packed block processing | Promising local candidate; profile first |
-| 2 | Hoist constant calculations and repeated divisions | Small | Less work inside scalar loops | Small, compiler-dependent |
-| 3 | Try LTO and inspect compiler vectorization | Small–medium | Better optimization across source files | Uncertain; inexpensive experiment |
-| 4 | Remove extra bias/residual copy passes | Small–medium | Less activation memory traffic | Small while matvec/recomputation dominate |
-| 5 | Precompute RoPE frequencies and reuse sine/cosine | Small–medium | Fewer repeated math-library calls | Local improvement, especially before caching |
-| 6 | Cache validated tensor views at model load | Medium | Avoid name scans and repeated shape work | Useful cleanup; probably secondary to model math |
-| 7 | Specialize packed matvec dispatch and scalar kernels | Medium | Less per-block branching and unpacking overhead | Potentially useful in hot kernels |
-| 8 | Evaluate the prompt once during prefill | Medium | Eliminate repeated prompt-prefix evaluation | Very high structural potential for first output |
-| 9 | Optionally decode selected weights once and use Accelerate | Medium–large | Exchange RAM/startup work for dense kernels | Experimental alternative; can increase bandwidth cost |
-| 10 | Add a persistent per-layer KV cache | Large | Compute each new token's layers once | Very high structural potential for decode |
-| 11 | Add ARM SIMD packed dot/matvec kernels | Large | Process more weights per instruction | High potential if packed kernels dominate |
-| 12 | Parallelize independent matrix rows | Large | Use multiple CPU cores | Potentially high; bounded by bandwidth and overhead |
-| 13 | Use blocked matrix-matrix products for batched prefill | Large–very large | Reuse weight tiles across prompt positions | High potential for longer prompts |
-| 14 | Store KV cache at reduced precision | Large–very large | Reduce cache RAM and memory reads | Most useful at long context; introduces rounding |
-| 15 | Tile/fuse attention with online softmax | Very large | Reduce attention memory traffic | More relevant after batched prefill or GPU work |
-| 16 | Build a Metal GPU execution backend | Very large | Accelerate the actual model's numerical work | High potential, substantial implementation effort |
-| 17 | Shared prefixes, paged KV, and continuous batching | Very large | Improve multi-request reuse and throughput | Low immediate value for this single-request CLI |
-| 18 | Speculative decoding | Very large | Verify several proposed tokens per target pass | Uncertain for this small model; requires earlier work |
+| 1 | Replace arithmetic F16 scale conversion | **Implemented** | Small | Native ARM conversion plus portable fallback; end-to-end gain was inconclusive |
+| 2 | Hoist constant calculations and repeated divisions | Planned | Small | Small compiler-dependent cleanup; profile first |
+| 3 | Try LTO and inspect compiler vectorization | Planned | Small–medium | Inexpensive experiment after stable benchmarks |
+| 4 | Remove extra bias/residual copy passes | **Partial** | Small–medium | Batched epilogues update in place; single-token helper still has copies |
+| 5 | Precompute RoPE frequencies and sine/cosine | Planned | Small–medium | Remove repeated power/trigonometry work |
+| 6 | Cache validated tensor views at model load | Planned | Medium | Remove name scans, formatting, and repeated view validation |
+| 7 | Specialize packed dispatch/block loops | **Partial** | Medium | NEON kernels exist; matrix loops still have format dispatch/block overhead |
+| 8 | Add a checked one-pass prefill API and skip unused logits | **Implemented** | Medium | Whole prompt submitted once; only final prompt position produces logits |
+| 9 | Optionally decode selected weights once/use Accelerate | Experimental | Medium–large | Trade RAM/startup for dense kernels; not implemented |
+| 10 | Add a persistent per-layer KV cache | **Implemented** | Large | Decode computes only the newly appended token |
+| 11 | Add ARM SIMD packed dot/matvec kernels | **Implemented** | Large | NEON for Q5_0/Q8_0/Q4_K/Q6_K, scalar fallback retained |
+| 12 | Parallelize independent matrix rows | **Implemented** | Large | OpenMP row parallelism; four workers currently preferred on the M2 |
+| 13 | Add bounded batched prefill projections | **Implemented; tune** | Large–very large | Layer-first chunks of eight; measure/tune block reuse and chunk size |
+| 14 | Store KV cache at reduced precision | Planned | Large–very large | Reduce long-context memory and cache bandwidth |
+| 15 | Tile/fuse attention with online softmax | Planned | Very large | More relevant for long context or GPU execution |
+| 16 | Build a Metal GPU execution backend | Planned | Very large | Highest hardware upside, substantial backend work |
+| 17 | Shared prefixes, paged KV, continuous batching | Future serving track | Very large | Multi-user throughput/memory management, not single-request tok/s |
+| 18 | Speculative decoding | Future | Very large | Requires fast verification and robust cache rollback |
 
-## 1. Replace arithmetic F16 scale conversion
+## 1. Replace arithmetic F16 scale conversion — implemented
 
 **Where:** `f16_bits_to_f32` in [quantization.cpp](../src/quantization.cpp).
 
-Use a portable conversion based on the floating-point bit representation, or a
-supported hardware conversion behind a portable fallback. This removes the
-need to express sign and exponent reconstruction through general math calls.
+ARM64 uses the compiler-supported native `__fp16` conversion, and other targets
+use portable IEEE-754 bit expansion. This removed the original `powf`/`ldexpf`
+reconstruction. It did not produce a reliable end-to-end tok/s improvement in
+short runs, so keep it as a correct low-overhead primitive rather than claiming
+it solved packed-matvec performance.
 The helper is shared by all packed formats, so a local improvement reaches
 many matrix products. Inspect generated code or profile it first: source-level
 calls do not prove that the compiler leaves every operation in the executable.
 
-**Validate:** all 65,536 F16 bit patterns against an independent conversion
-reference, including signed zero, subnormals, infinities, and NaNs. Compare NaN
-classification rather than requiring an arbitrary payload. Run all existing
-block-decoding and dot-product checks. Keep the documented conversion semantics.
+**Validated:** all 65,536 F16 bit patterns against an independent arithmetic
+reference, including signed zero, subnormals, infinities, and NaNs, plus the
+existing block-decoding, dot-product, and mixed-forward checks.
 
 ## 2. Hoist constants and repeated divisions
 
@@ -136,15 +149,17 @@ Avoid making global `-ffast-math` the shortcut: its assumptions about non-finite
 values conflict with the engine's explicit NaN/Inf rejection contract.
 See the [Clang floating-point options](https://clang.llvm.org/docs/UsersManual.html#controlling-floating-point-behavior).
 
-## 4. Remove extra bias and residual copy passes
+## 4. Remove extra bias and residual copy passes — partially implemented
 
 **Where:** `qwen2_layer_project` and the attention/FFN residual updates in
 [qwen2_architecture.cpp](../src/qwen2_architecture.cpp).
 
-Bias addition currently writes a temporary vector and then copies it to the
-projection buffer. Residual addition also writes scratch before copying back
-to the activation. Dedicated internal operations with an explicit in-place
-contract can remove those extra passes. Fuse bias application into a projection
+The single-token `qwen2_layer_project` path still writes a temporary vector and
+copies it to the projection buffer. Its residual additions also use scratch.
+The batched prefill path applies projection biases and residuals directly, so
+this item now mainly concerns cached single-token decode. Dedicated internal
+operations with an explicit in-place contract can remove those remaining passes.
+Fuse bias application into a projection
 epilogue later if the kernel interface makes that natural.
 
 **Validate:** preserve the public tensor helpers' existing aliasing contracts;
@@ -184,12 +199,14 @@ fixtures mutate tensor metadata after initialization to force a late failure.
 If views become immutable cached descriptors, adapt that injection point while
 retaining an independent late-failure/retry test and malformed-load coverage.
 
-## 7. Specialize packed dispatch and scalar block loops
+## 7. Specialize packed dispatch and block loops — partially implemented
 
 **Where:** [quantized_matvec.cpp](../src/quantized_matvec.cpp) and Q5_0/Q8_0/
 Q4_K/Q6_K dot helpers in [quantization.cpp](../src/quantization.cpp).
 
-Select a format-specific loop once per matrix operation rather than expressing
+ARM64 format-specific NEON dot kernels are implemented, but the surrounding
+matrix loops can still be specialized further. Select a format-specific loop
+once per matrix operation rather than expressing
 a format switch for every block. Simplify Q5_0 unpacking in groups where that
 avoids per-element selection. Profile separate unpacking, scale conversion,
 and accumulation costs before adding more specialized code. The compiler may
@@ -200,32 +217,25 @@ unaligned storage, input/output guards, and mixed-weight logits. Preserve safe
 loads: a mapped tensor base does not make every packed block aligned. Existing
 direct packed dot products already avoid decoding complete matrices per call.
 
-## 8. Evaluate the prompt once
+## 8. Add a checked prefill API and skip unused logits — implemented
 
-**Where:** the app prefill loop, a new shared engine/architecture prefill entry
-point, and the full-prefix evaluation schedule.
+**Where:** [app.cpp](../src/app.cpp), [engine.cpp](../src/engine.cpp), the
+architecture interface, and Qwen2 prefill scheduling.
 
-The app needs logits only after the complete prompt. Today it evaluates the
-prefix of length 1, then 2, and so on through the prompt length `P`. Add a checked
-prefill operation that accepts the prompt IDs and evaluates the complete causal
-prefix once. Keep model-private history management behind the engine interface.
-This can initially reuse scalar matvecs and existing full-prefix workspace.
+`engine_prefill_tokens` now validates and submits the prompt as one operation.
+The Qwen2 callback has transactional logical commit: invalid requests leave the
+state untouched, and a processing failure hides attempted future K/V slots,
+restores the old token count, invalidates logits, and permits retry. Only the
+last prompt position runs final normalization and `output.weight`.
 
-The projection/FFN work, counted in evaluated token positions, changes from
-`P * (P + 1) / 2` to `P`. For an illustrative 40-token formatted prompt, that is
-820 position evaluations versus 40. This is a work count, **not a promised
-20.5× wall-clock speedup**. Repeated attention work is also eliminated.
-The final normalization and vocabulary projection also run once rather than
-once for every prompt token.
+The active engine already had cached token execution by the time this API was
+added, so the historical `P*(P+1)/2` full-prefix-work argument no longer applied.
+The realized savings at this stage came from removing intermediate vocabulary
+projections and establishing the contract needed by item 13.
 
-**Validate:** final logits and committed history match sequential reference
-prefill for every tested prefix; only final prompt logits are used; invalid
-IDs and exhausted context are rejected; failure does not partially commit
-history. Update app contract tests to cover the new prefill API.
-
-This improves time to first output. Later generated-token calls still recompute
-their prefixes until item 10 is implemented. It is separate from the matrix-matrix
-batching in item 13.
+**Validated:** final logits and K/V contents against sequential cached prefill,
+invalid IDs/counts/capacity, late failure and retry, mixed quantization, chunk
+boundaries, and decode immediately after prefill.
 
 ## 9. Optional: decode selected weights once and use Accelerate
 
@@ -250,20 +260,17 @@ latency. Treat this as an alternative to spending effort on packed CPU kernels,
 not an automatic prerequisite. Enabling llama.cpp's BLAS flag alone does not
 accelerate the project's own layer execution.
 
-## 10. Add a persistent per-layer KV cache
+## 10. Add a persistent per-layer KV cache — implemented
 
 **Where:** `Qwen2InferenceState`, state initialization/destruction, and the Qwen
-forward schedule. This changes the documented full-prefix implementation contract.
+cached forward schedule.
 
-Store K and V for **every layer and every committed position**, and process only
-the new token's embedding, Q/K/V, attention output, and FFN on a decode call.
-Attention for that token reads earlier cached K/V. Store keys after RoPE and
-values without RoPE. The existing temporary arrays cannot simply be relabeled
-as the cache: they currently hold only one layer's data at a time.
-
-Projection and FFN work becomes one position per appended token instead of the
-whole prefix. Attention for one new token still reads the prior context; its
-cost is not constant as context grows.
+K and V are stored for every layer and committed position in
+`[layer][position][KV head][head dimension]` order. Keys are cached after RoPE;
+values are cached without RoPE. Decode processes only the new token's embedding,
+Q/K/V, attention output, and FFN, while attention reads prior cached K/V.
+Projection and FFN work is therefore one position per generated token. Attention
+still reads a growing history, so long-context decode is not constant-cost.
 
 For this local model, an F32 cache needs:
 
@@ -273,66 +280,72 @@ For this local model, an F32 cache needs:
 = 768 MiB at 32,768 positions
 ```
 
-Allocate for the requested context, with checked arithmetic and memory limits.
-Use the KV-head count, not the query-head count. Old full-prefix activation
-workspace may be reduced for decode, although batched prefill needs its own
-bounded workspace.
+Allocation uses the requested context and checked arithmetic, based on KV-head
+rather than query-head count. Batched prefill has separate bounded chunk scratch.
+The retained full-prefix fixture validates cached logits at successive positions;
+additional long-context and multi-state stress coverage remains worthwhile.
+Failed/retried calls do not expose partial future slots through the committed
+position count.
 
-**Validate:** compare every vocabulary logit with the retained full-prefix
-reference at successive positions, multiple layers, GQA, and longer histories.
-Check model/state matching, causal visibility, context boundaries, and two
-independent inference states. Commit position only after the whole new token
-succeeds; failed/retried calls must not expose partial cache entries as history.
+## 11. Add ARM SIMD kernels — implemented
 
-## 11. Add ARM SIMD kernels
+**Where:** packed dot helpers in [quantization.cpp](../src/quantization.cpp).
 
-**Where:** optional CPU kernel implementations behind the current numerical API.
+ARM64 NEON implementations now cover Q5_0, Q8_0, Q4_K, and Q6_K unpacking and
+dot accumulation; non-ARM builds retain scalar fallbacks. Vector reductions can
+change accumulation order, so forward tests use justified tolerances. The
+[NEON guide](quantized-neon-beginners-guide.md) documents the implementation.
+Further work should be driven by per-format real-model timing rather than adding
+intrinsics indiscriminately.
 
-Vectorize unpacking and dot accumulation, starting with a simple packed type
-such as Q8_0 before Q5_0 and the K formats. Add the required CPU-feature checks
-and retain scalar fallbacks. Inspect compiler vectorization first; manual SIMD
-should target work that remains expensive after the earlier changes.
+**Validated:** unaligned packed storage, all supported quantized types,
+reference block math, and mixed/full forward paths with numerical tolerances.
+Future kernel changes must continue to inspect close greedy ties; readable
+output alone is not enough evidence.
 
-**Validate:** tails, unaligned data, all quantized types, extreme values, and
-the full forward reference. Vector reductions/FMA can change accumulation
-rounding. Compare logits with justified tolerances and inspect close greedy
-ties; readable output alone is not enough evidence.
+## 12. Parallelize matrix rows — implemented with OpenMP
 
-## 12. Parallelize matrix rows
+**Where:** F32 and packed matrix-vector/matrix-batch execution.
 
-**Where:** matrix-vector execution and inference workspace/thread ownership.
+Independent output rows use static OpenMP scheduling. Thread-count experiments
+on the M2 found four workers faster than 2, 6, or 8 for the tested workload.
+This is not a persistent custom worker pool, so OpenMP region overhead and
+small-operation thresholds remain possible follow-up work. Avoid nested worker
+pools if a future library backend owns its own threads.
 
-Rows of a matrix-vector product have independent output values. Partition
-contiguous row ranges among a persistent, bounded worker pool; avoid starting
-threads for each row or each token. Allocate worker state during initialization.
-Keep small operations serial, and measure thread counts rather than assuming
-all logical cores are best.
+**Validated:** disjoint output writes, synchronized completion, numerical
+parity, and worker-failure propagation with multiple thread counts. Race tooling,
+memory-bandwidth saturation measurements, and small-operation thresholds remain
+useful follow-up work.
 
-**Validate:** disjoint output writes, synchronized completion, deterministic
-error propagation, and thread-safe use of model views. Run race checks as well
-as numerical tests. Measure memory-bandwidth saturation and avoid nested worker
-pools when a library backend already owns its own threads.
+## 13. Use bounded matrix-batch products for prefill — implemented; tune next
 
-## 13. Use blocked matrix-matrix products for prefill
+**Where:** Qwen2 prefill scheduling, [tensor.cpp](../src/tensor.cpp), and
+[quantized_matvec.cpp](../src/quantized_matvec.cpp).
 
-**Where:** the prefill schedule and new batched projection kernels.
+Prompt positions are processed layer-first in chunks of up to eight. Q/K/V,
+attention-output, and FFN projections accept token-major activation batches for
+F32 and Q5_0/Q8_0/Q4_K/Q6_K weights. Each aligned packed block is loaded once
+for an output row/block and applied across the chunk through existing
+format-specific dot kernels. Scratch is allocated once during state creation.
 
-Process multiple prompt positions as an activation matrix. Reuse a weight tile
-across those positions rather than streaming the whole matrix again for every
-matvec. Begin with bounded chunks so long prompts do not require unbounded
-intermediate buffers. This can use a prepared dense BLAS backend or custom
-packed matrix-matrix kernels; the two approaches have different memory costs.
+Each token receives RoPE at its absolute position. The chunk's K/V entries are
+written to the persistent cache before attention; each query passes only
+`position+1` visible entries, so later positions in the chunk remain causally
+invisible. Attention itself still runs one query position at a time and does not
+materialize a full prompt-by-prompt score matrix. Only the final prompt position
+produces vocabulary logits; decode stays on the single-token NEON path.
 
-**Dependencies:** a correct one-pass prefill API, clear position handling, and
-a defined way to populate persistent K/V when item 10 is enabled.
-
-**Validate:** chunk boundaries, causal masking within a chunk, GQA, RoPE positions,
-final prompt logits, and subsequent cached decode against the scalar reference.
-Batching prompt positions is distinct from batching independent user requests.
+**Validated:** batch-kernel reference results, exact and non-exact chunk tails,
+causal/GQA behavior through the forward fixture, K/V and final-logit parity,
+late-failure rollback, mixed formats, and subsequent cached decode. Next measure
+chunk sizes and consider deeper unpack reuse only if it produces repeatable TTFT
+improvement over run-to-run and cold/warm variation. Batching prompt positions
+remains distinct from batching independent user requests.
 
 ## 14. Reduce KV-cache precision
 
-**Where:** cache storage and attention reads, after F32 cached decode is correct.
+**Where:** cache storage and attention reads, now that F32 cached decode is correct.
 
 Store K/V as F16, or later use a separately designed quantized cache with scales.
 For this model's full context, F16 halves the calculated F32 cache from 768 MiB
@@ -356,7 +369,7 @@ are not speedup predictions for this scalar CPU implementation.
 The current single-query helper already stores only a score vector per head,
 not a full context-by-context matrix. Do not justify this item by claiming
 that the current code materializes a quadratic attention matrix. The larger
-opportunity appears when adding batched prefill or GPU attention.
+opportunity is most likely at longer contexts, larger prefill chunks, or with GPU attention.
 
 **Validate:** numerically stable online normalization, causal tile boundaries,
 GQA, and outputs across short/long sequences. Preserve a simple attention
@@ -365,6 +378,12 @@ reference to diagnose numerical and indexing errors.
 ## 16. Build a Metal backend
 
 **Where:** new GPU numerical kernels, resource ownership, and dispatch code.
+
+**Status:** the dispatch seam exists. `src/matrix_backend.h` defines F32 and packed
+matvec/matmul operations; the CPU backend wraps the current kernels and
+`src/matrix_backend_gpu.cpp` is an empty, unavailable stub. Still open: Metal
+kernels, device-resident weight/K/V ownership (the API currently passes host
+pointers), and an explicit backend selection mechanism.
 
 Keep model weights and K/V available to the GPU across token steps, implement
 or convert the packed weight formats, and move projections, attention, and FFN
@@ -413,30 +432,35 @@ model or proposal mechanism to pay for itself.
 context limits, acceptance rate, added memory, and total time including proposal
 work. Never equate a high draft acceptance rate with an actual speedup.
 
-## Suggested implementation path
+## Suggested next implementation path
 
-Start with measurement and item 1. Try the small local changes where profiling
-supports them, but prioritize **item 8: one-pass prefill** before spending much
-time on small copy/lookup improvements. Next, implement **item 10: an F32 KV
-cache**, keeping the existing full-prefix path as the correctness reference.
+The old path through prefill, KV caching, NEON, row parallelism, and batched
+prefill is complete. First stabilize measurement: report prefill separately from
+decode, benchmark fixed prompt IDs with alternating cold/warm runs, and tune the
+prefill chunk size. Then remove measured decode overhead such as repeated tensor
+lookup/view construction or copies. Precompute RoPE values if profiling confirms
+its value at realistic contexts.
 
-Then profile again. Choose packed SIMD/row parallelism if packed CPU kernels
-dominate, or investigate the dense Accelerate alternative if the RAM budget
-allows. Add blocked prefill after the basic schedule is correct. Treat a Metal
-backend as a separate larger milestone. Multi-request scheduling and speculation
-can wait for a concrete need beyond this CLI.
+After those CPU cleanups, choose deliberately between two tracks:
+
+- **single-user local speed:** evaluate deeper packed batch kernels, reduced-KV
+  precision, or a Metal backend;
+- **serving throughput:** introduce request ownership/scheduling, continuous
+  batching, and only then paged/shared-prefix KV management.
+
+Dense Accelerate remains an experiment constrained by the large F32 expansion
+of quantized weights. Fused attention matters more at long context or on GPU;
+short-context profiles currently point to projections, not attention.
 
 ```mermaid
 flowchart TD
-    A[Measure load, prefill, first token, and decode] --> B[Improve F16 conversion and measured local hot spots]
-    B --> C[One-pass prompt prefill]
-    C --> D[Persistent per-layer F32 KV cache]
-    D --> E[Profile the new execution path]
-    E --> F[Packed SIMD and row parallelism]
-    E --> G[Optional prepared dense Accelerate backend]
-    F --> H[Blocked batched prefill]
-    G --> H
-    H --> I[Optional fused attention and Metal backend]
+    A[Implemented: KV cache + NEON + OpenMP + batched prefill] --> B[Separate and stabilize prefill/decode benchmarks]
+    B --> C[Tune chunk size and measured CPU overhead]
+    C --> D{Project direction}
+    D --> E[Local speed: deeper packed kernels or Metal]
+    D --> F[Serving: scheduler and continuous batching]
+    E --> G[Optional reduced-precision KV and fused attention]
+    F --> H[Paged KV and shared prefixes]
 ```
 
 ## Acceptance for each optimization
