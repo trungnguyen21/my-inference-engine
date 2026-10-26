@@ -458,6 +458,66 @@ static float q4_k_dot_neon(
 }
 #endif
 
+#if defined(__AVX2__)
+static inline void q4_k_accumulate_8_avx2(
+    __m128i nibbles, const float *input, float scale, float minimum,
+    __m256 *sum
+)
+{
+    __m256i int32_vals = _mm256_cvtepu8_epi32(nibbles);
+    __m256 float_vals = _mm256_cvtepi32_ps(int32_vals);
+    __m256 v_scale = _mm256_set1_ps(scale);
+    __m256 v_min = _mm256_set1_ps(minimum);
+
+    // weights = (float_vals * scale) - minimum
+    // using fmsub (fused multiply-subtract)
+    __m256 weights = _mm256_fmsub_ps(float_vals, v_scale, v_min);
+    
+    __m256 input_vals = _mm256_loadu_ps(input);
+    *sum = _mm256_fmadd_ps(weights, input_vals, *sum);
+}
+
+static float q4_k_dot_avx2(
+    const Q4_KBlock *block, const float *input,
+    float scale_factor, float min_factor
+)
+{
+    __m256 sum0 = _mm256_setzero_ps();
+    __m256 sum1 = _mm256_setzero_ps();
+    __m256 sum2 = _mm256_setzero_ps();
+    __m256 sum3 = _mm256_setzero_ps();
+    __m128i mask_low = _mm_set1_epi8(0x0F);
+
+    for (int subblock = 0; subblock < Q4_K_SUBBLOCK_COUNT; ++subblock) {
+        uint8_t scale_multiplier, min_multiplier;
+        q4_k_unpack_scale_min(block->scale_and_min, subblock,
+                              &scale_multiplier, &min_multiplier);
+        const float scale = scale_factor * scale_multiplier;
+        const float minimum = min_factor * min_multiplier;
+        const uint8_t *packed = block->packed_nibbles + (subblock / 2) * 32;
+        const float *values = input + subblock * 32;
+        
+        for (int i = 0; i < 32; i += 16) {
+            __m128i bytes = _mm_loadu_si128((const __m128i*)(packed + i));
+            __m128i nibbles = (subblock & 1)
+                ? _mm_and_si128(_mm_srli_epi16(bytes, 4), mask_low)
+                : _mm_and_si128(bytes, mask_low);
+                
+            // Split the 16 bytes into two 8-byte chunks
+            // (In AVX2, _mm256_cvtepu8_epi32 only takes a 128-bit vector and uses the lower 64 bits)
+            q4_k_accumulate_8_avx2(nibbles, values + i, scale, minimum, &sum0);
+            q4_k_accumulate_8_avx2(_mm_srli_si128(nibbles, 8), values + i + 8, scale, minimum, &sum1);
+        }
+    }
+    
+    __m256 sum = _mm256_add_ps(sum0, sum1);
+    __m128 sum_half = _mm_add_ps(_mm256_castps256_ps128(sum), _mm256_extractf128_ps(sum, 1));
+    sum_half = _mm_hadd_ps(sum_half, sum_half);
+    sum_half = _mm_hadd_ps(sum_half, sum_half);
+    return _mm_cvtss_f32(sum_half);
+}
+#endif
+
 int q4_k_dot_f32(const Q4_KBlock *block, const float *input, float *result)
 {
     if (block == nullptr || input == nullptr || result == nullptr) {
@@ -471,6 +531,8 @@ int q4_k_dot_f32(const Q4_KBlock *block, const float *input, float *result)
 
 #if defined(__aarch64__) && defined(__ARM_NEON)
     *result = q4_k_dot_neon(block, input, scale_factor, min_factor);
+#elif defined(__AVX2__)
+    *result = q4_k_dot_avx2(block, input, scale_factor, min_factor);
 #else
     float sum = 0.0f;
     for (int subblock = 0; subblock < Q4_K_SUBBLOCK_COUNT; ++subblock) {
@@ -591,6 +653,71 @@ static float q6_k_dot_neon(const Q6_KBlock *block, const float *input, float sca
 }
 #endif
 
+#if defined(__AVX2__)
+static float q6_k_dot_avx2(const Q6_KBlock *block, const float *input, float scale_factor)
+{
+    __m256 sum0 = _mm256_setzero_ps();
+    __m256 sum1 = _mm256_setzero_ps();
+    
+    __m128i center = _mm_set1_epi8(32);
+    __m128i mask15 = _mm_set1_epi8(15);
+    __m128i mask3 = _mm_set1_epi8(3);
+
+    for (int group = 0; group < 2; ++group) {
+        for (int region = 0; region < 4; ++region) {
+            const int lower_base = group * 64 + (region & 1) * 32;
+            const int upper_base = group * 32;
+            const int input_base = group * 128 + region * 32;
+            const int scale_base = group * 8 + region * 2;
+            
+            // In AVX2 we cannot do a vectorized arbitrary shift without AVX512 (vpshlv).
+            // We use simple scalar loops or generic logical shifts with constant multiples.
+            // But _mm_srl_epi16 only takes a single shift value for the whole register.
+            // Since `region` is constant per loop iteration, the shift amount is constant.
+            int low_shift_count = (region >> 1) * 4;
+            int high_shift_count = region * 2;
+            
+            __m128i v_low_shift = _mm_cvtsi32_si128(low_shift_count);
+            __m128i v_high_shift = _mm_cvtsi32_si128(high_shift_count);
+            __m128i v_shift_left_4 = _mm_cvtsi32_si128(4);
+
+            for (int half = 0; half < 2; ++half) {
+                const int offset = half * 16;
+                
+                __m128i lower = _mm_loadu_si128((const __m128i*)(block->lower_bits + lower_base + offset));
+                __m128i upper = _mm_loadu_si128((const __m128i*)(block->upper_bits + upper_base + offset));
+                
+                __m128i lo = _mm_and_si128(_mm_srl_epi16(lower, v_low_shift), mask15);
+                __m128i hi = _mm_and_si128(_mm_srl_epi16(upper, v_high_shift), mask3);
+                
+                // Shift hi left by 4 (to occupy bit 4 and 5)
+                hi = _mm_sll_epi16(hi, v_shift_left_4);
+                
+                // Combine and subtract 32
+                __m128i weights = _mm_sub_epi8(_mm_or_si128(lo, hi), center);
+                
+                const float scale = scale_factor * block->scales[scale_base + half];
+                __m256 v_scale = _mm256_set1_ps(scale);
+                
+                const float *values = input + input_base + offset;
+                
+                // q5_0_accumulate_8_avx2 uses exactly what we need: widen 8 ints, scale, multiply, accumulate
+                q5_0_accumulate_8_avx2(weights, values, v_scale, &sum0);
+                q5_0_accumulate_8_avx2(_mm_srli_si128(weights, 8), values + 8, v_scale, &sum1);
+            }
+        }
+    }
+    
+    __m256 sum = _mm256_add_ps(sum0, sum1);
+    
+    __m128 sum_half = _mm_add_ps(_mm256_castps256_ps128(sum), _mm256_extractf128_ps(sum, 1));
+    sum_half = _mm_hadd_ps(sum_half, sum_half);
+    sum_half = _mm_hadd_ps(sum_half, sum_half);
+    
+    return _mm_cvtss_f32(sum_half);
+}
+#endif
+
 int q6_k_dot_f32(const Q6_KBlock *block, const float *input, float *result)
 {
     if (block == nullptr || input == nullptr || result == nullptr) {
@@ -602,6 +729,8 @@ int q6_k_dot_f32(const Q6_KBlock *block, const float *input, float *result)
 
 #if defined(__aarch64__) && defined(__ARM_NEON)
     *result = q6_k_dot_neon(block, input, scale_factor);
+#elif defined(__AVX2__)
+    *result = q6_k_dot_avx2(block, input, scale_factor);
 #else
     float sum = 0.0f;
     for (int group = 0; group < 2; ++group) {
