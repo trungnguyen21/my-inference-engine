@@ -4,6 +4,8 @@
 
 #if defined(__aarch64__) && defined(__ARM_NEON)
 #include <arm_neon.h>
+#elif defined(__x86_64__) || defined(__amd64__)
+#include <immintrin.h>
 #endif
 
 int f16_bits_to_f32(uint16_t bits, float *result)
@@ -98,6 +100,43 @@ static float q8_0_dot_neon(const Q8_0Block *block, const float *input, float sca
 }
 #endif
 
+#if defined(__AVX2__)
+static float q8_0_dot_avx2(const Q8_0Block *block, const float *input, float scale)
+{
+    // Create an accumulator filled with 8 zeros
+    __m256 sum = _mm256_setzero_ps();
+
+    // Broadcast the scale to all 8 lanes
+    __m256 v_scale = _mm256_set1_ps(scale);
+
+    // Q8_0 has 32 elements. AVX2 processes 8 at a time.
+    for (int i = 0; i < Q8_0_BLOCK_ELEMENTS; i += 8) {
+        // 1. Load 8 integers (AVX2 has a specific instruction to load and widen 8-bit ints to 32-bit ints)
+        __m128i int8_vals = _mm_loadu_si128((const __m128i*)(block->quantized_values + i));
+        __m256i int32_vals = _mm256_cvtepi8_epi32(int8_vals);
+
+        // 2. Convert 32-bit integers to 32-bit floats
+        __m256 float_weights = _mm256_cvtepi32_ps(int32_vals);
+
+        // 3. Load 8 input activations
+        __m256 input_vals = _mm256_loadu_ps(input + i);
+
+        // 4. Math: weights * scale * inputs.
+        // We use FMA (Fused Multiply-Add): sum = (weights * scale) * inputs + sum
+        __m256 scaled_weights = _mm256_mul_ps(float_weights, v_scale);
+        sum = _mm256_fmadd_ps(scaled_weights, input_vals, sum);
+    }
+
+    // Finally, add the 8 lanes together into a single float
+    // (AVX2 makes this slightly annoying, but here is the standard idiom)
+    __m128 sum_half = _mm_add_ps(_mm256_castps256_ps128(sum), _mm256_extractf128_ps(sum, 1));
+    sum_half = _mm_hadd_ps(sum_half, sum_half);
+    sum_half = _mm_hadd_ps(sum_half, sum_half);
+
+    return _mm_cvtss_f32(sum_half);
+}
+#endif
+
 int q8_0_dot_f32(const Q8_0Block *block, const float *input, float *result)
 {
     if ((block == nullptr) || (input == nullptr) || (result == nullptr)) {
@@ -107,6 +146,8 @@ int q8_0_dot_f32(const Q8_0Block *block, const float *input, float *result)
     f16_bits_to_f32(block->scale_f16_bits, &decoded_scale);
 #if defined(__aarch64__) && defined(__ARM_NEON)
     *result = q8_0_dot_neon(block, input, decoded_scale);
+#elif defined(__AVX2__)
+    *result = q8_0_dot_avx2(block, input, decoded_scale);
 #else
     float res = 0.0f;
     for (int i = 0; i < Q8_0_BLOCK_ELEMENTS; i++) {
@@ -177,6 +218,104 @@ static float q5_0_dot_neon(const Q5_0Block *block, const float *input, float sca
 }
 #endif
 
+#if defined(__AVX2__)
+static inline void q5_0_accumulate_8_avx2(
+    __m128i weights, const float *input, __m256 v_scale,
+    __m256 *sum
+)
+{
+    // Widen 8 signed 8-bit integers to 32-bit integers, then convert to floats
+    __m256i int32_vals = _mm256_cvtepi8_epi32(weights);
+    __m256 float_weights = _mm256_cvtepi32_ps(int32_vals);
+
+    // Load 8 input activations
+    __m256 input_vals = _mm256_loadu_ps(input);
+
+    // Math: weights * scale * inputs + sum
+    __m256 scaled_weights = _mm256_mul_ps(float_weights, v_scale);
+    *sum = _mm256_fmadd_ps(scaled_weights, input_vals, *sum);
+}
+
+static float q5_0_dot_avx2(const Q5_0Block *block, const float *input, float scale)
+{
+    __m256 sum0 = _mm256_setzero_ps();
+    __m256 sum1 = _mm256_setzero_ps();
+    __m256 sum2 = _mm256_setzero_ps();
+    __m256 sum3 = _mm256_setzero_ps();
+
+    __m256 v_scale = _mm256_set1_ps(scale);
+    __m128i center = _mm_set1_epi8(16);
+    __m128i mask_low = _mm_set1_epi8(0x0F);
+
+    // Q5_0 block has 32 elements. The 16 packed bytes hold all 32 values' low 4 bits.
+    // i=0 corresponds to the first 8 packed bytes.
+    for (int i = 0; i < 16; i += 8) {
+        // Load 8 packed bytes (which contain 16 weights: 8 low, 8 high)
+        // Since we only want to load 64 bits (8 bytes), we use _mm_loadl_epi64.
+        __m128i packed = _mm_loadl_epi64((const __m128i*)(block->packed_nibbles + i));
+
+        // Extract low and high nibbles
+        __m128i low_bits = _mm_and_si128(packed, mask_low);
+        __m128i upper_bits = _mm_and_si128(_mm_srli_epi16(packed, 4), mask_low);
+
+        // The fifth bits for the entire block are in block->high_bits (4 bytes).
+        // Each bit in high_bits corresponds to a weight.
+        // For i=0, we need bits 0-7 for low, and bits 16-23 for upper.
+        // For i=8, we need bits 8-15 for low, and bits 24-31 for upper.
+
+        // Load the single byte containing the 8 fifth bits we need.
+        uint8_t low_fifth_byte = block->high_bits[i / 8];
+        uint8_t upper_fifth_byte = block->high_bits[2 + i / 8];
+
+        // To combine them efficiently in AVX2, we broadcast the single byte to a 64-bit vector,
+        // then use a shuffle to isolate each bit, but a simpler portable AVX2 way for 8 bits
+        // is to unpack them manually into an __m128i register.
+
+        // We can create a vector where each byte has the corresponding bit isolated.
+        __m128i bit_masks = _mm_setr_epi8(1, 2, 4, 8, 16, 32, 64, 128, 0, 0, 0, 0, 0, 0, 0, 0);
+        __m128i v_low_fifth_byte = _mm_set1_epi8(low_fifth_byte);
+        __m128i v_upper_fifth_byte = _mm_set1_epi8(upper_fifth_byte);
+
+        // Test bits: if the bit is set, the result is the bit mask itself. We want 0 or 16.
+        // Compare with mask to get 0xFF if set, 0x00 if not.
+        __m128i low_fifth = _mm_and_si128(v_low_fifth_byte, bit_masks);
+        __m128i upper_fifth = _mm_and_si128(v_upper_fifth_byte, bit_masks);
+
+        // _mm_cmpeq_epi8 gives 0xFF if equal, 0x00 if not. We compare against bit_masks.
+        low_fifth = _mm_cmpeq_epi8(low_fifth, bit_masks);
+        upper_fifth = _mm_cmpeq_epi8(upper_fifth, bit_masks);
+
+        // Now mask with 16 to set the fifth bit value (0 or 16)
+        __m128i bit_16 = _mm_set1_epi8(16);
+        low_fifth = _mm_and_si128(low_fifth, bit_16);
+        upper_fifth = _mm_and_si128(upper_fifth, bit_16);
+
+        // Combine nibbles and fifth bit, subtract 16
+        __m128i low = _mm_sub_epi8(_mm_or_si128(low_bits, low_fifth), center);
+        __m128i upper = _mm_sub_epi8(_mm_or_si128(upper_bits, upper_fifth), center);
+
+        // Accumulate into our running sums
+        if (i == 0) {
+            q5_0_accumulate_8_avx2(low, input, v_scale, &sum0);
+            q5_0_accumulate_8_avx2(upper, input + 16, v_scale, &sum2);
+        } else {
+            q5_0_accumulate_8_avx2(low, input + 8, v_scale, &sum1);
+            q5_0_accumulate_8_avx2(upper, input + 24, v_scale, &sum3);
+        }
+    }
+
+    // Combine the 4 sums into one
+    __m256 sum = _mm256_add_ps(_mm256_add_ps(sum0, sum1), _mm256_add_ps(sum2, sum3));
+
+    // Horizontal addition to reduce the 8 lanes to a single float
+    __m128 sum_half = _mm_add_ps(_mm256_castps256_ps128(sum), _mm256_extractf128_ps(sum, 1));
+    sum_half = _mm_hadd_ps(sum_half, sum_half);
+    sum_half = _mm_hadd_ps(sum_half, sum_half);
+
+    return _mm_cvtss_f32(sum_half);
+}
+#endif
+
 int q5_0_dot_f32(const Q5_0Block *block, const float *input, float *result)
 {
     if ((block == nullptr) || (input == nullptr) || (result == nullptr)) {
@@ -187,6 +326,8 @@ int q5_0_dot_f32(const Q5_0Block *block, const float *input, float *result)
     f16_bits_to_f32(block->scale_f16_bits, &decoded_scale);
 #if defined(__aarch64__) && defined(__ARM_NEON)
     *result = q5_0_dot_neon(block, input, decoded_scale);
+#elif defined(__AVX2__)
+    *result = q5_0_dot_avx2(block, input, decoded_scale);
 #else
     float res = 0.0f;
     for (int i = 0; i < Q5_0_BLOCK_ELEMENTS; i++) {

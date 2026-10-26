@@ -7,6 +7,18 @@ set(CMAKE_CXX_STANDARD 11)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
 
+# Enable AVX2 and FMA on x86_64 architecture (e.g., Linux/Google Colab)
+if(CMAKE_SYSTEM_PROCESSOR MATCHES "amd64|x86_64|AMD64")
+    # -mavx2: enables 256-bit wide vector instructions
+    # -mfma: enables fused multiply-add (a * b + c)
+    # -mf16c: enables hardware conversion between 16-bit and 32-bit floats
+    if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
+        add_compile_options(-mavx2 -mfma -mf16c)
+    elseif(MSVC)
+        add_compile_options(/arch:AVX2)
+    endif()
+endif()
+
 # Let editors use the same include paths and compiler flags as the build.
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 
