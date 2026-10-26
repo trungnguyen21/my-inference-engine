@@ -379,11 +379,14 @@ reference to diagnose numerical and indexing errors.
 
 **Where:** new GPU numerical kernels, resource ownership, and dispatch code.
 
-**Status:** the dispatch seam exists. `src/matrix_backend.h` defines F32 and packed
-matvec/matmul operations; the CPU backend wraps the current kernels and
-`src/matrix_backend_gpu.cpp` is an empty, unavailable stub. Still open: Metal
-kernels, device-resident weight/K/V ownership (the API currently passes host
-pointers), and an explicit backend selection mechanism.
+**Status:** the dispatch seam exists. `src/matrix_backend.h` defines two
+operations, `matvec` and `matmul`, over a `MatrixWeight` (dense F32 or packed
+GGUF view). The CPU backend bridges that to the current kernels, and
+`src/matrix_backend_gpu.cpp` holds two documented, unavailable, vendor-neutral
+stubs. Still open: the GPU kernels themselves (Metal or CUDA; CUDA needs NVIDIA
+hardware, which an Apple Silicon Mac does not have), device-resident weight/K/V
+ownership (the API currently passes host pointers), and an explicit backend
+selection mechanism.
 
 Keep model weights and K/V available to the GPU across token steps, implement
 or convert the packed weight formats, and move projections, attention, and FFN

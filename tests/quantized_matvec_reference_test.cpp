@@ -69,7 +69,7 @@ static void test_q8_0_two_row_matrix(void)
         Q8_0_BLOCK_BYTES
     );
 
-    assert(quantized_tensor_matvec_f32(&view, input, 32, output, 2) == 1);
+    assert(matrix_matvec_packed_f32(&view, input, 32, output, 2) == 1);
     assert(floats_nearly_equal(output[0], -3.0f));
     assert(floats_nearly_equal(output[1], 5.0f));
 }
@@ -95,7 +95,7 @@ static void test_q5_0_single_row_matrix(void)
         Q5_0_BLOCK_BYTES
     );
 
-    assert(quantized_tensor_matvec_f32(&view, input, 32, output, 1) == 1);
+    assert(matrix_matvec_packed_f32(&view, input, 32, output, 1) == 1);
     assert(floats_nearly_equal(output[0], -8.0f));
 }
 
@@ -123,7 +123,7 @@ static void test_q4_k_single_row_matrix(void)
         Q4_K_BLOCK_BYTES
     );
 
-    assert(quantized_tensor_matvec_f32(&view, input, 256, output, 1) == 1);
+    assert(matrix_matvec_packed_f32(&view, input, 256, output, 1) == 1);
     assert(floats_nearly_equal(output[0], -0.25f));
 }
 
@@ -149,7 +149,7 @@ static void test_q6_k_single_row_matrix(void)
         Q6_K_BLOCK_BYTES
     );
 
-    assert(quantized_tensor_matvec_f32(&view, input, 256, output, 1) == 1);
+    assert(matrix_matvec_packed_f32(&view, input, 256, output, 1) == 1);
     assert(floats_nearly_equal(output[0], -16.0f));
 }
 
@@ -183,12 +183,12 @@ static void test_multirow_multiblock_matrix(uint32_t type)
     omp_set_dynamic(0);
     omp_set_num_threads(1);
 #endif
-    assert(quantized_tensor_matvec_f32(&view, input.data(), columns,
+    assert(matrix_matvec_packed_f32(&view, input.data(), columns,
                                       serial.data() + 1, rows) == 1);
 #ifdef _OPENMP
     omp_set_num_threads(4);
 #endif
-    assert(quantized_tensor_matvec_f32(&view, input.data(), columns,
+    assert(matrix_matvec_packed_f32(&view, input.data(), columns,
                                       parallel.data() + 1, rows) == 1);
     assert(memcmp(serial.data(), parallel.data(), serial.size() * sizeof(float)) == 0);
     assert(serial.front() == -999.0f && serial.back() == -999.0f);
@@ -214,9 +214,9 @@ static void test_q8_0_batched_matrix(void)
     inputs[Q8_0_BLOCK_ELEMENTS] = -1; inputs[Q8_0_BLOCK_ELEMENTS + 1] = 3;
     setup_matrix_view(&view, blocks, ENGINE_GGML_TYPE_Q8_0,
                       Q8_0_BLOCK_ELEMENTS, 2, Q8_0_BLOCK_ELEMENTS, Q8_0_BLOCK_BYTES);
-    assert(quantized_tensor_matvec_f32(&view, inputs, 32, expected, 2));
-    assert(quantized_tensor_matvec_f32(&view, inputs + 32, 32, expected + 2, 2));
-    assert(quantized_tensor_matmul_f32(&view, inputs, 32, 2, outputs, 2));
+    assert(matrix_matvec_packed_f32(&view, inputs, 32, expected, 2));
+    assert(matrix_matvec_packed_f32(&view, inputs + 32, 32, expected + 2, 2));
+    assert(matrix_matmul_packed_f32(&view, inputs, 32, 2, outputs, 2));
     for (int i = 0; i < 4; ++i) assert(floats_nearly_equal(outputs[i], expected[i]));
 }
 
@@ -239,23 +239,23 @@ static void test_invalid_arguments(void)
         Q8_0_BLOCK_BYTES
     );
 
-    assert(quantized_tensor_matvec_f32(nullptr, input, 32, output, 1) == 0);
-    assert(quantized_tensor_matvec_f32(&view, nullptr, 32, output, 1) == 0);
-    assert(quantized_tensor_matvec_f32(&view, input, 32, nullptr, 1) == 0);
-    assert(quantized_tensor_matvec_f32(&view, input, 31, output, 1) == 0);
-    assert(quantized_tensor_matvec_f32(&view, input, 32, output, 2) == 0);
-    assert(quantized_tensor_matmul_f32(&view, input, 32, 0, output, 1) == 0);
+    assert(matrix_matvec_packed_f32(nullptr, input, 32, output, 1) == 0);
+    assert(matrix_matvec_packed_f32(&view, nullptr, 32, output, 1) == 0);
+    assert(matrix_matvec_packed_f32(&view, input, 32, nullptr, 1) == 0);
+    assert(matrix_matvec_packed_f32(&view, input, 31, output, 1) == 0);
+    assert(matrix_matvec_packed_f32(&view, input, 32, output, 2) == 0);
+    assert(matrix_matmul_packed_f32(&view, input, 32, 0, output, 1) == 0);
 
     view.dimension_count = 1;
-    assert(quantized_tensor_matvec_f32(&view, input, 32, output, 1) == 0);
+    assert(matrix_matvec_packed_f32(&view, input, 32, output, 1) == 0);
 
     view.dimension_count = 2;
     view.ggml_type = 99u;
-    assert(quantized_tensor_matvec_f32(&view, input, 32, output, 1) == 0);
+    assert(matrix_matvec_packed_f32(&view, input, 32, output, 1) == 0);
 
     view.ggml_type = ENGINE_GGML_TYPE_Q8_0;
     view.block_count = 0u;
-    assert(quantized_tensor_matvec_f32(&view, input, 32, output, 1) == 0);
+    assert(matrix_matvec_packed_f32(&view, input, 32, output, 1) == 0);
 }
 
 int main(void)

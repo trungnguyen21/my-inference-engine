@@ -83,7 +83,7 @@ static int quantized_row_dot_f32(
     return 1;
 }
 
-int quantized_tensor_matvec_f32(
+int matrix_matvec_packed_f32(
     const GgufQuantizedTensorView *matrix,
     const float *input,
     int input_count,
@@ -161,7 +161,7 @@ int quantized_tensor_matvec_f32(
     return !failed;
 }
 
-int quantized_tensor_matmul_f32(
+int matrix_matmul_packed_f32(
     const GgufQuantizedTensorView *matrix, const float *inputs,
     int input_count, int batch_count, float *outputs, int output_count)
 {

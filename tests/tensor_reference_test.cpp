@@ -67,7 +67,7 @@ static void test_matrix_vector_product(void)
     const float expected[] = {-2.0f, -2.0f};
     float output[] = {0.0f, 0.0f};
 
-    assert(tensor_matvec_f32(matrix, 2, 3, input, output) == 1);
+    assert(matrix_matvec_dense_f32(matrix, 2, 3, input, output) == 1);
     assert(arrays_nearly_equal(output, expected, 2));
 }
 
@@ -77,7 +77,7 @@ static void test_matrix_batch_product(void)
     const float inputs[] = {1, 0, -1, 2, 1, 0};
     const float expected[] = {-2, -2, 4, 13};
     float outputs[4] = {};
-    assert(tensor_matmul_f32(matrix, 2, 3, inputs, 2, outputs) == 1);
+    assert(matrix_matmul_dense_f32(matrix, 2, 3, inputs, 2, outputs) == 1);
     assert(arrays_nearly_equal(outputs, expected, 4));
 }
 
@@ -146,10 +146,10 @@ static void test_invalid_arguments(void)
     assert(tensor_add_f32(values, values, 0, output) == 0);
     assert(tensor_dot_f32(values, values, 3, nullptr) == 0);
     assert(tensor_dot_f32(values, values, -1, &result) == 0);
-    assert(tensor_matvec_f32(nullptr, 2, 2, values, output) == 0);
-    assert(tensor_matvec_f32(matrix, 0, 2, values, output) == 0);
-    assert(tensor_matvec_f32(matrix, 2, -1, values, output) == 0);
-    assert(tensor_matmul_f32(matrix, 2, 2, values, 0, output) == 0);
+    assert(matrix_matvec_dense_f32(nullptr, 2, 2, values, output) == 0);
+    assert(matrix_matvec_dense_f32(matrix, 0, 2, values, output) == 0);
+    assert(matrix_matvec_dense_f32(matrix, 2, -1, values, output) == 0);
+    assert(matrix_matmul_dense_f32(matrix, 2, 2, values, 0, output) == 0);
 
     assert(tensor_rms_norm_f32(nullptr, values, 3, 0.00001f, output) == 0);
     assert(tensor_rms_norm_f32(values, nullptr, 3, 0.00001f, output) == 0);

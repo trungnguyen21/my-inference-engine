@@ -125,15 +125,24 @@ the commands above for the current automated suite.
 
 ### Matrix backends
 
-Qwen2 projections go through the backend-neutral API in `src/matrix_backend.h`
-(`matrix_backend_matvec_f32`, `matrix_backend_matmul_f32`, and the packed
-`..._quantized` equivalents). `matrix_backend_default()` currently returns the CPU
-backend (`src/matrix_backend_cpu.cpp`), which delegates to the existing OpenMP/NEON
-kernels. `src/matrix_backend_gpu.cpp` is an intentionally empty, unavailable
-placeholder: its descriptor has `available = 0` and null operations, so every
-checked call fails without touching the output. A future Metal backend fills in
-those function pointers; selecting it is a one-line change in
-`matrix_backend_default()`.
+Qwen2 projections go through the backend-neutral API in `src/matrix_backend.h`.
+A backend implements two operations, `matvec` and `matmul`, over a `MatrixWeight`
+that describes either dense F32 weights (`matrix_weight_dense`) or a packed GGUF
+view (`matrix_weight_packed`). Callers use `matrix_backend_matvec` and
+`matrix_backend_matmul`, which validate the weight, buffers, and overlap once, so
+every backend gets the same checks. Qwen2 resolves a named tensor into a
+`MatrixWeight` in one place (`qwen2_apply_weight`), for both single vectors and
+token-major batches.
+
+`matrix_backend_default()` currently returns the CPU backend
+(`src/matrix_backend_cpu.cpp`), which bridges a `MatrixWeight` to the OpenMP/NEON
+kernels. Kernel names follow `matrix_<op>_<dense|packed>_f32`, for example
+`matrix_matvec_packed_f32`. `src/matrix_backend_gpu.cpp` holds documented stubs for
+the two operations; they are GPU-API neutral (Metal, CUDA, or other). They return
+failure without touching any buffer, and the descriptor keeps `available = 0`, so
+the checked wrappers refuse it. A GPU implementation replaces the stub bodies and
+flips `available` once both operations match the CPU backend; selecting it is then
+a one-line change in `matrix_backend_default()`.
 
 ### Quantized matvec microbenchmark
 

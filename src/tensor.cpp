@@ -44,7 +44,7 @@ int tensor_dot_f32(
     return 1;
 }
 
-int tensor_matvec_f32(
+int matrix_matvec_dense_f32(
     const float *matrix,
     int rows,
     int columns,
@@ -71,7 +71,7 @@ int tensor_matvec_f32(
     return 1;
 }
 
-int tensor_matmul_f32(
+int matrix_matmul_dense_f32(
     const float *matrix, int rows, int columns,
     const float *inputs, int batch_count, float *outputs
 ) {

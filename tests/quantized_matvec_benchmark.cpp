@@ -75,13 +75,13 @@ static bool benchmark(const Format &format, int rows, int columns, int repetitio
     view.block_count = blocks;
 
     for (int i = 0; i < 2; ++i) {
-        if (!quantized_tensor_matvec_f32(&view, input.data(), columns, output.data(), rows)) return false;
+        if (!matrix_matvec_packed_f32(&view, input.data(), columns, output.data(), rows)) return false;
     }
     std::vector<double> milliseconds;
     milliseconds.reserve((size_t)repetitions);
     for (int i = 0; i < repetitions; ++i) {
         auto start = std::chrono::steady_clock::now();
-        bool ok = quantized_tensor_matvec_f32(&view, input.data(), columns, output.data(), rows) != 0;
+        bool ok = matrix_matvec_packed_f32(&view, input.data(), columns, output.data(), rows) != 0;
         auto end = std::chrono::steady_clock::now();
         if (!ok) return false;
         milliseconds.push_back(std::chrono::duration<double, std::milli>(end - start).count());

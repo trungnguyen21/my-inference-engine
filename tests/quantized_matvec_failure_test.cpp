@@ -77,7 +77,7 @@ static void test_failures()
             view.block_elements = format.elements;
             view.block_bytes = format.bytes;
             view.block_count = rows * blocks_per_row;
-            assert(quantized_tensor_matvec_f32(&view, input.data(), columns,
+            assert(matrix_matvec_packed_f32(&view, input.data(), columns,
                                               output.data(), rows) == (failed_row < 0));
             for (int row = 0; row < rows; ++row) {
                 assert(output[row] == (row == failed_row ? -99.0f : 2.0f));

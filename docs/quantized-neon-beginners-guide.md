@@ -53,8 +53,8 @@ For a tiny example, weights `[2, -1, 3, 4]` and input `[5, 6, 7, 8]` produce `2�
 
 There are **two ways of reading weights**, but they compute the same mathematical operation:
 
-- `tensor_matvec_f32` in [`src/tensor.cpp`](../src/tensor.cpp) reads weights already stored as F32 values.
-- `quantized_tensor_matvec_f32` in [`src/quantized_matvec.cpp`](../src/quantized_matvec.cpp) reads packed blocks. It calls a block-dot function in [`src/quantization.cpp`](../src/quantization.cpp) to reconstruct the effective weights *while* doing the dot product. It does **not** create a full F32 copy of the matrix.
+- `matrix_matvec_dense_f32` in [`src/tensor.cpp`](../src/tensor.cpp) reads weights already stored as F32 values.
+- `matrix_matvec_packed_f32` in [`src/quantized_matvec.cpp`](../src/quantized_matvec.cpp) reads packed blocks. It calls a block-dot function in [`src/quantization.cpp`](../src/quantization.cpp) to reconstruct the effective weights *while* doing the dot product. It does **not** create a full F32 copy of the matrix.
 
 [`qwen2_weight_matvec`](../src/qwen2_architecture.cpp) chooses the path based on **each weight tensor's GGUF type**: F32 weights use the first path; Q5_0, Q8_0, Q4_K, and Q6_K weights use the second. The *input activations are F32 in both cases*. “Quantized matvec” describes the stored **weights**, not F32 versus quantized inputs.
 
@@ -93,8 +93,8 @@ The picture shows **four F32 products**, not all of the Q-format unpacking. Real
 
 ### Follow one matvec through the code
 
-1. [`qwen2_weight_matvec`](../src/qwen2_architecture.cpp) sees the GGUF weight type and calls `quantized_tensor_matvec_f32` for a packed matrix.
-2. [`quantized_tensor_matvec_f32`](../src/quantized_matvec.cpp) checks dimensions and block layout, then assigns independent matrix rows to workers. OpenMP can spread rows across CPU threads.
+1. [`qwen2_weight_matvec`](../src/qwen2_architecture.cpp) sees the GGUF weight type, describes the matrix as a `MatrixWeight`, and calls `matrix_backend_matvec`. The CPU backend ([`src/matrix_backend_cpu.cpp`](../src/matrix_backend_cpu.cpp)) then calls `matrix_matvec_packed_f32` for a packed matrix.
+2. [`matrix_matvec_packed_f32`](../src/quantized_matvec.cpp) checks dimensions and block layout, then assigns independent matrix rows to workers. OpenMP can spread rows across CPU threads.
 3. The row worker loops over its packed blocks. It copies each block into a local struct with `memcpy`: GGUF bytes need not be aligned like a C++ block struct.
 4. A format-specific `q*_dot_f32` in [`src/quantization.cpp`](../src/quantization.cpp) decodes the F16 scale and, on supported ARM64 builds, calls its NEON dot function. Otherwise it uses the scalar implementation.
 5. Each block contributes a partial dot product. The row worker adds block results and writes **one** output value for that row.
@@ -159,7 +159,7 @@ The per-16 scale matters: applying one scale to a whole 256-value block would be
 
 ## Supported machines and numerical behavior
 
-The NEON code in [`src/quantization.cpp`](../src/quantization.cpp) is compiled when both `__aarch64__` and `__ARM_NEON` are defined (for example, a suitable ARM64/Apple Silicon build). Elsewhere, the existing scalar block-dot implementations remain available. This work does **not** add SIMD to `tensor_matvec_f32`, and it is not x86 SIMD or Metal acceleration.
+The NEON code in [`src/quantization.cpp`](../src/quantization.cpp) is compiled when both `__aarch64__` and `__ARM_NEON` are defined (for example, a suitable ARM64/Apple Silicon build). Elsewhere, the existing scalar block-dot implementations remain available. This work does **not** add SIMD to `matrix_matvec_dense_f32`, and it is not x86 SIMD or Metal acceleration.
 
 The NEON versions add partial sums in a different order from the scalar loop. Floating-point addition can round differently depending on order: `(a + b) + c` need not have exactly the same bits as `a + (b + c)`. Tests therefore check suitably close answers, not bit-for-bit identity. Format packing errors are different: a wrong bit, nibble, scale, or input index is a **bug**, not harmless rounding. Compare logits and generated behavior with the real model before trusting a backend change.
 

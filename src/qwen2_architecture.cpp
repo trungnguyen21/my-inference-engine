@@ -564,6 +564,113 @@ static int qwen2_get_layer_vector(
     return 1;
 }
 
+/* A named GGUF tensor described for the matrix backend. `packed` is the storage
+ * that `weight.packed` points to, so keep this struct in place (do not copy it). */
+struct Qwen2ResolvedWeight {
+    MatrixWeight weight;
+    GgufQuantizedTensorView packed;
+    uint32_t type;
+};
+
+/* Validate the tensor's shape/storage and describe it as a MatrixWeight. This
+ * is the only place Qwen2 distinguishes dense F32 from packed weights. */
+static int qwen2_resolve_weight(
+    const GgufFile *file, const char *name, int input_count, int output_count,
+    Qwen2ResolvedWeight *resolved, char *error, int error_capacity)
+{
+    const GgufTensorInfo *tensor = gguf_find_tensor(file, name);
+    if (!tensor_has_shape(tensor, (uint64_t)input_count, (uint64_t)output_count)) {
+        if (error != nullptr && error_capacity > 0) {
+            snprintf(error, (size_t)error_capacity,
+                     "Qwen2 tensor %s is missing or has an invalid matrix shape.", name);
+        }
+        return 0;
+    }
+    resolved->type = tensor->type;
+    if (tensor->type == ENGINE_GGML_TYPE_F32) {
+        GgufF32TensorView view;
+        if (!gguf_get_f32_tensor_view(file, name, &view) ||
+            !matrix_weight_dense(&resolved->weight, view.data, output_count, input_count)) {
+            if (error != nullptr && error_capacity > 0) {
+                snprintf(error, (size_t)error_capacity,
+                         "Qwen2 tensor %s must be a valid F32 matrix with %d columns and %d rows.",
+                         name, input_count, output_count);
+            }
+            return 0;
+        }
+        return 1;
+    }
+    if (!gguf_get_quantized_tensor_view(file, name, &resolved->packed) ||
+        !matrix_weight_packed(&resolved->weight, &resolved->packed) ||
+        resolved->weight.columns != input_count || resolved->weight.rows != output_count) {
+        if (error != nullptr && error_capacity > 0) {
+            snprintf(error, (size_t)error_capacity,
+                     "Qwen2 packed matrix %s has invalid or unsupported data.", name);
+        }
+        return 0;
+    }
+    return 1;
+}
+
+static int qwen2_run_backend(
+    const MatrixBackend *backend, const MatrixWeight *weight, const float *inputs,
+    int batch_count, bool single_vector, float *outputs)
+{
+    return single_vector
+        ? matrix_backend_matvec(backend, weight, inputs, outputs)
+        : matrix_backend_matmul(backend, weight, inputs, batch_count, outputs);
+}
+
+/* Shared path for one vector (matvec) and a token-major batch (matmul): the same
+ * argument checks, weight resolution, profiling, and error handling for both. */
+static int qwen2_apply_weight(
+    const GgufFile *file, const char *name, const float *inputs, int input_count,
+    int batch_count, bool single_vector, float *outputs, int output_count,
+    char *error, int error_capacity)
+{
+    if (file == nullptr || name == nullptr || inputs == nullptr || outputs == nullptr ||
+        input_count <= 0 || output_count <= 0 || batch_count <= 0) {
+        set_error(error, error_capacity,
+                  single_vector ? "Qwen2 weight-matvec arguments are invalid."
+                                : "Qwen2 weight-matmul arguments are invalid.");
+        return 0;
+    }
+    Qwen2ResolvedWeight resolved;
+    if (!qwen2_resolve_weight(file, name, input_count, output_count,
+                              &resolved, error, error_capacity)) {
+        return 0;
+    }
+
+    const MatrixBackend *backend = matrix_backend_default();
+    int succeeded;
+    if (active_weight_profile == nullptr) {
+        // No clock reads or per-format bookkeeping on the unprofiled path.
+        succeeded = qwen2_run_backend(backend, &resolved.weight, inputs,
+                                      batch_count, single_vector, outputs);
+    } else {
+        double *seconds;
+        unsigned long long *calls;
+        weight_profile_targets(resolved.type, name, &seconds, &calls);
+        {
+            OperationTimer timer(seconds != nullptr, seconds);
+            succeeded = qwen2_run_backend(backend, &resolved.weight, inputs,
+                                          batch_count, single_vector, outputs);
+        }
+        if (succeeded && calls != nullptr) ++*calls;
+    }
+    if (!succeeded) {
+        if (error != nullptr && error_capacity > 0) {
+            snprintf(error, (size_t)error_capacity,
+                     "Qwen2 %s%s multiplication failed for %s.",
+                     resolved.weight.kind == MATRIX_WEIGHT_PACKED ? "packed " : "",
+                     single_vector ? "matrix-vector" : "batched matrix", name);
+        }
+        return 0;
+    }
+    if (error != nullptr && error_capacity > 0) error[0] = '\0';
+    return 1;
+}
+
 int qwen2_weight_matvec(
     const GgufFile *file,
     const char *name,
@@ -575,84 +682,8 @@ int qwen2_weight_matvec(
     int error_capacity
 )
 {
-    GgufF32TensorView view;
-    const MatrixBackend *backend = matrix_backend_default();
-
-    if (file == nullptr || name == nullptr || input == nullptr ||
-        output == nullptr || input_count <= 0 || output_count <= 0 || input == output) {
-        set_error(error, error_capacity, "Qwen2 weight-matvec arguments are invalid.");
-        return 0;
-    }
-    const GgufTensorInfo *tensor = gguf_find_tensor(file, name);
-    if (!tensor_has_shape(tensor, (uint64_t)input_count, (uint64_t)output_count)) {
-        if (error != nullptr && error_capacity > 0) {
-            snprintf(error, (size_t)error_capacity,
-                     "Qwen2 tensor %s is missing or has an invalid matrix shape.", name);
-        }
-        return 0;
-    }
-    if (tensor->type != ENGINE_GGML_TYPE_F32) {
-        GgufQuantizedTensorView packed;
-        if (!gguf_get_quantized_tensor_view(file, name, &packed)) {
-            if (error != nullptr && error_capacity > 0) {
-                snprintf(error, (size_t)error_capacity,
-                         "Qwen2 packed matrix %s has invalid or unsupported data.", name);
-            }
-            return 0;
-        }
-        int succeeded;
-        if (active_weight_profile == nullptr) {
-            // No clock reads or per-format bookkeeping on the unprofiled path.
-            succeeded = matrix_backend_matvec_quantized(backend, &packed, input, input_count, output, output_count);
-        } else {
-            double *seconds;
-            unsigned long long *calls;
-            weight_profile_targets(tensor->type, name, &seconds, &calls);
-            {
-                OperationTimer timer(seconds != nullptr, seconds);
-                succeeded = matrix_backend_matvec_quantized(backend, &packed, input, input_count, output, output_count);
-            }
-            if (succeeded && calls != nullptr) ++*calls;
-        }
-        if (!succeeded) {
-            if (error != nullptr && error_capacity > 0) {
-                snprintf(error, (size_t)error_capacity,
-                         "Qwen2 packed matrix-vector multiplication failed for %s.", name);
-            }
-            return 0;
-        }
-        if (error != nullptr && error_capacity > 0) error[0] = '\0';
-        return 1;
-    }
-    if (!gguf_get_f32_tensor_view(file, name, &view)) {
-        if (error != nullptr && error_capacity > 0) {
-            snprintf(error, (size_t)error_capacity,
-                     "Qwen2 tensor %s must be a valid F32 matrix with %d columns and %d rows.",
-                     name, input_count, output_count);
-        }
-        return 0;
-    }
-    int succeeded;
-    if (active_weight_profile == nullptr) {
-        succeeded = matrix_backend_matvec_f32(backend, view.data, output_count, input_count, input, output);
-    } else {
-        double *seconds;
-        unsigned long long *calls;
-        weight_profile_targets(tensor->type, name, &seconds, &calls);
-        {
-            OperationTimer timer(seconds != nullptr, seconds);
-            succeeded = matrix_backend_matvec_f32(backend, view.data, output_count, input_count, input, output);
-        }
-        if (succeeded && calls != nullptr) ++*calls;
-    }
-    if (!succeeded) {
-        if (error != nullptr && error_capacity > 0) {
-            snprintf(error, (size_t)error_capacity,
-                     "Qwen2 matrix-vector multiplication failed for %s.", name);
-        }
-        return 0;
-    }
-    return 1;
+    return qwen2_apply_weight(file, name, input, input_count, 1, true,
+                              output, output_count, error, error_capacity);
 }
 
 static int qwen2_weight_matmul(
@@ -660,41 +691,8 @@ static int qwen2_weight_matmul(
     int input_count, int batch_count, float *outputs, int output_count,
     char *error, int error_capacity)
 {
-    if (file == nullptr || name == nullptr || inputs == nullptr || outputs == nullptr ||
-        input_count <= 0 || output_count <= 0 || batch_count <= 0) {
-        set_error(error, error_capacity, "Qwen2 weight-matmul arguments are invalid.");
-        return 0;
-    }
-    const GgufTensorInfo *tensor = gguf_find_tensor(file, name);
-    if (!tensor_has_shape(tensor, (uint64_t)input_count, (uint64_t)output_count)) {
-        set_error(error, error_capacity, "Qwen2 batched weight has an invalid shape.");
-        return 0;
-    }
-    const MatrixBackend *backend = matrix_backend_default();
-    double *seconds = nullptr;
-    unsigned long long *calls = nullptr;
-    weight_profile_targets(tensor->type, name, &seconds, &calls);
-    int succeeded = 0;
-    {
-        OperationTimer timer(seconds != nullptr, seconds);
-        if (tensor->type == ENGINE_GGML_TYPE_F32) {
-            GgufF32TensorView view;
-            if (gguf_get_f32_tensor_view(file, name, &view))
-                succeeded = matrix_backend_matmul_f32(backend, view.data, output_count, input_count,
-                                                      inputs, batch_count, outputs);
-        } else {
-            GgufQuantizedTensorView view;
-            if (gguf_get_quantized_tensor_view(file, name, &view))
-                succeeded = matrix_backend_matmul_quantized(backend, &view, inputs, input_count,
-                                                            batch_count, outputs, output_count);
-        }
-    }
-    if (!succeeded) {
-        set_error(error, error_capacity, "Qwen2 batched matrix multiplication failed.");
-        return 0;
-    }
-    if (calls != nullptr) ++*calls;
-    return 1;
+    return qwen2_apply_weight(file, name, inputs, input_count, batch_count, false,
+                              outputs, output_count, error, error_capacity);
 }
 
 static int qwen2_layer_matmul(
