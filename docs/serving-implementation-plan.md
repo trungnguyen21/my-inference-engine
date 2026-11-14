@@ -168,6 +168,52 @@ Handle several requests at once in one process.
 
 **Done when:** four simultaneous requests stream in parallel on one machine.
 
+### Measured: concurrency buys latency fairness, not throughput
+
+4 requests x 16 tokens, Qwen2.5-0.5B Q4_K_M, M2 (4 performance + 4 efficiency cores):
+
+| Configuration | Total threads | Wall time |
+|---|---|---|
+| Sequential, 4 threads | 4 | **5.4-5.9 s** |
+| Sequential, 8 threads | 8 | 12.2-12.7 s |
+| 4 concurrent, 1 thread each | 4 | 6.0 s |
+| 4 concurrent, 2 threads each | 8 | 6.6 s |
+
+Running four requests at once takes the **same total time** as running them one
+after another. What changes is the distribution: concurrently every client
+finishes around 6 s, sequentially the first finishes at ~1.4 s and the last at
+~5.9 s. That is a real property worth demonstrating — it is just not a
+throughput win, and the demo should not claim one.
+
+Two causes, both worth understanding:
+
+1. **Memory bandwidth is the ceiling.** Every token streams the whole ~400 MB of
+   weight tensors from RAM. Four concurrent requests need four times the memory
+   traffic for the same tokens, and bandwidth is already saturated at one
+   request. Threads cannot fix a bandwidth problem.
+2. **`schedule(static)` plus heterogeneous cores.** Work is split evenly up
+   front, so a team waits at its barrier for whichever thread landed on an
+   efficiency core — those run roughly 3x slower but got equal work. This is why
+   8 threads is **2.2x slower** than 4. Trying `schedule(dynamic)` in
+   `src/quantized_matvec.cpp:153,195` and `src/tensor.cpp:62,83` is an open
+   experiment.
+
+The real throughput fix is **batching**: run N requests through one weight read
+instead of N, which turns the bandwidth cost from N x into 1 x. That is a
+substantial engine project, not a serving-layer change, and it is the honest
+answer to "how would you make this faster".
+
+### Thread count is set through the API, not the environment
+
+`engine_set_max_threads` / `engine.SetMaxThreads` override `OMP_NUM_THREADS`.
+This exists because OpenMP's thread count is **per-thread state**, so setting it
+once from a startup thread would not reach workers; the value is applied inside
+`engine_run` on the thread that enters the parallel regions.
+
+Why it matters: with 4 workers and the default (all cores), 4 x 8 = 32 threads
+land on 8 cores and a 7 s workload becomes a 120 s one. The Go test suite hit
+exactly this.
+
 **Memory cost at various context limits** (per worker):
 
 | Max context | Per worker | x4 workers |
@@ -275,5 +321,5 @@ manifests**. Running it on one node is a rehearsal. The same `Deployment` that
 crowds four pods onto a laptop spreads them across four nodes the moment nodes
 exist.
 
-Concurrency and Kubernetes are independent. The throughput win comes from running
-requests concurrently (Phase 3), which needs no orchestration at all.
+Concurrency and Kubernetes are independent — and, measured on this machine,
+**concurrency does not improve throughput either.** See below.

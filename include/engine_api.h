@@ -100,6 +100,30 @@ int engine_error_capacity(void);
  */
 int engine_prompt_capacity(void);
 
+/*
+ * Threads one generation call may use inside the engine's kernels, as OpenMP
+ * resolved it: OMP_NUM_THREADS when set, otherwise the core count. Returns 1
+ * when built without OpenMP.
+ *
+ * This is per call, not per process. A host running N concurrent requests uses
+ * up to N * engine_max_threads() threads, so a server should report this to
+ * make oversubscription visible.
+ */
+int engine_max_threads(void);
+
+/*
+ * Request how many threads each generation uses, overriding OMP_NUM_THREADS.
+ * Pass a positive count, or 0 to return to the environment's default.
+ *
+ * Call this during startup, before serving. The value is applied on whichever
+ * thread later calls engine_run, which is what makes it work when a host runs
+ * requests on a pool of threads: OpenMP's thread count is per-thread state, so
+ * setting it once from a startup thread would not otherwise affect workers.
+ *
+ * Returns the count that will be used, or 0 when built without OpenMP.
+ */
+int engine_set_max_threads(int threads);
+
 #ifdef __cplusplus
 }
 #endif

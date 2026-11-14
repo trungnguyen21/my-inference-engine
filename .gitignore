@@ -63,3 +63,6 @@ engine-sample*.txt
 # Python helper caches
 __pycache__/
 *.py[cod]
+
+# Go server build output
+/server/server

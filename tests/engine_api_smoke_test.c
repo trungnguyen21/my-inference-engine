@@ -7,7 +7,12 @@
  * Needs models/qwen-2.5.gguf, so this is not registered as a ctest. Run it
  * from the repository root:
  *     cmake --build build --target engine_api_smoke_test
- *     OMP_NUM_THREADS=2 ./build/engine_api_smoke_test
+ *     ./build/engine_api_smoke_test
+ *
+ * The thread count is pinned below rather than left to OMP_NUM_THREADS. The
+ * concurrency section runs THREADS requests at once, so inheriting "all cores"
+ * would put THREADS * ncpu threads on ncpu cores and take minutes instead of
+ * seconds.
  */
 #include "engine_api.h"
 
@@ -18,6 +23,7 @@
 #define MODEL_PATH "models/qwen-2.5.gguf"
 #define SESSION_CONTEXT 192
 #define THREADS 4
+#define ENGINE_THREADS 2 /* per request; see the note above */
 
 static int failures;
 
@@ -177,8 +183,14 @@ int main(void)
 {
     char error[512];
     EngineHandle *handle;
+    int default_threads;
 
-    printf("engine_api smoke test (model: %s)\n\n", MODEL_PATH);
+    printf("engine_api smoke test (model: %s)\n", MODEL_PATH);
+    /* Read the default before changing it: C does not define the order in
+     * which printf's arguments are evaluated. */
+    default_threads = engine_max_threads();
+    printf("pinning %d thread(s) per request (default was %d)\n\n",
+           engine_set_max_threads(ENGINE_THREADS), default_threads);
     handle = engine_open(MODEL_PATH, error, sizeof(error));
     if (handle == NULL) {
         printf("could not open model: %s\n", error);

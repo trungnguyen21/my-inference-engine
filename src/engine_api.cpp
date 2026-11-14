@@ -8,6 +8,10 @@
 #include <stdlib.h>
 #include <string.h>
 
+#ifdef _OPENMP
+#include <omp.h>
+#endif
+
 struct EngineHandle {
     Model model;
 };
@@ -37,6 +41,42 @@ int engine_error_capacity(void)
 int engine_prompt_capacity(void)
 {
     return ENGINE_PROMPT_CAPACITY;
+}
+
+/*
+ * Thread count requested by the host, or 0 to leave OpenMP's default alone.
+ * Written once during startup and read by every engine_run, so a plain int is
+ * sufficient; callers are documented to set it before serving traffic.
+ */
+static int requested_threads;
+
+int engine_set_max_threads(int threads)
+{
+#ifdef _OPENMP
+    if (threads < 0) {
+        return omp_get_max_threads();
+    }
+    requested_threads = threads;
+    if (threads > 0) {
+        /* Apply to this thread too, so engine_max_threads reports it now. */
+        omp_set_num_threads(threads);
+    }
+    return omp_get_max_threads();
+#else
+    (void)threads;
+    return 0;
+#endif
+}
+
+int engine_max_threads(void)
+{
+#ifdef _OPENMP
+    /* Reports the value OpenMP actually resolved, which is more useful than
+     * echoing OMP_NUM_THREADS: unset is the common case. */
+    return omp_get_max_threads();
+#else
+    return 1;
+#endif
 }
 
 EngineHandle *engine_open(const char *gguf_path, char *error, int error_capacity)
@@ -168,6 +208,15 @@ int engine_run(EngineSession *session, const char *prompt, int max_tokens,
         set_error(error, error_capacity, "Prompt is too long.");
         return 0;
     }
+
+#ifdef _OPENMP
+    /* OpenMP's thread count is per-thread state, and a host may call engine_run
+     * from any thread in a pool. Apply the requested count here, on the thread
+     * that will actually enter the parallel regions. */
+    if (requested_threads > 0) {
+        omp_set_num_threads(requested_threads);
+    }
+#endif
 
     /* Reuse this session's buffers; nothing below allocates. */
     inference_state_reset(&session->state);
