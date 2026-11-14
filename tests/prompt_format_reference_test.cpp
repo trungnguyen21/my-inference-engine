@@ -87,7 +87,7 @@ int main(int argc, char **argv)
     expect_prompt("Hello");
     expect_prompt("");
     expect_prompt(u8"Hello\nViệt Nam 世界\n");
-    const std::string longest(PROMPT_CAPACITY - 1, 'a');
+    const std::string longest(ENGINE_PROMPT_CAPACITY - 1, 'a');
     expect_prompt(longest.c_str());
 
     const auto format = qwen2_architecture_ops()->format_prompt;

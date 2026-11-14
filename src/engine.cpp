@@ -16,7 +16,7 @@ static void set_error(char *error, int capacity, const char *message)
     }
 }
 
-int engine_load_model(const AppConfig *config, Model *model,
+int engine_load_model(const char *model_path, Model *model,
                       char *error, int error_capacity)
 {
     EngineModel *implementation;
@@ -33,8 +33,12 @@ int engine_load_model(const AppConfig *config, Model *model,
     if (error != nullptr && error_capacity > 0) {
         error[0] = '\0';
     }
-    if (config == nullptr) {
-        set_error(error, error_capacity, "App configuration is null.");
+    if (model_path == nullptr) {
+        set_error(error, error_capacity, "Model path is null.");
+        return 0;
+    }
+    if (strlen(model_path) >= ENGINE_MODEL_PATH_CAPACITY) {
+        set_error(error, error_capacity, "Model path is too long.");
         return 0;
     }
 
@@ -44,7 +48,7 @@ int engine_load_model(const AppConfig *config, Model *model,
         return 0;
     }
     implementation->gguf.file_descriptor = -1;
-    if (!gguf_open(config->model_path, &implementation->gguf,
+    if (!gguf_open(model_path, &implementation->gguf,
                    error, error_capacity)) {
         gguf_close(&implementation->gguf);
         free(implementation);
@@ -84,7 +88,7 @@ int engine_load_model(const AppConfig *config, Model *model,
         }
         goto failure;
     }
-    if (!tokenizer_load_from_gguf(config->model_path, &implementation->tokenizer,
+    if (!tokenizer_load_from_gguf(model_path, &implementation->tokenizer,
                                   model->config.vocab_size,
                                   error, error_capacity)) {
         goto failure;
@@ -267,4 +271,18 @@ void inference_state_destroy(InferenceState *state)
         state_header->architecture->state_destroy(state);
     }
     memset(state, 0, sizeof(*state));
+}
+
+void inference_state_reset(InferenceState *state)
+{
+    EngineStateHeader *state_header;
+
+    if (state == nullptr) {
+        return;
+    }
+    state_header = (EngineStateHeader *)state->implementation;
+    if (state_header != nullptr && state_header->architecture != nullptr &&
+        state_header->architecture->state_reset != nullptr) {
+        state_header->architecture->state_reset(state);
+    }
 }

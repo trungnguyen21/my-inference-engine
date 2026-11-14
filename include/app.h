@@ -1,8 +1,11 @@
 #ifndef INFERENCE_APP_H
 #define INFERENCE_APP_H
 
-#define MODEL_PATH_CAPACITY 1024
-#define PROMPT_CAPACITY 4096
+#include "engine.h"
+
+/* The CLI's argument buffers track the engine's input limits. */
+#define MODEL_PATH_CAPACITY ENGINE_MODEL_PATH_CAPACITY
+#define PROMPT_CAPACITY ENGINE_PROMPT_CAPACITY
 
 typedef struct AppConfig {
     char model_path[MODEL_PATH_CAPACITY];
