@@ -1,0 +1,15 @@
+# Keep the build context small. Without this, every `docker build` ships the
+# 469 MB model plus the whole CMake tree to the daemon before anything runs.
+build/
+.git/
+.vscode/
+.DS_Store
+media/
+docs/
+*.md
+
+# The model is mounted or copied explicitly, never swept in by the context.
+models/
+
+# Go build output
+server/server

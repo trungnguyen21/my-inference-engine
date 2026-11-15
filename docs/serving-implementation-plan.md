@@ -272,7 +272,7 @@ exactly this.
 
 ---
 
-## Phase 4 — Container
+## Phase 4 — Container  ✅ DONE (image build pending local verification)
 
 **Tasks**
 
@@ -286,6 +286,41 @@ exactly this.
    produces errors.
 
 **Done when:** `docker run` gives the same behaviour as Phase 3.
+
+**Delivered.** `Dockerfile` (multi-stage), `.dockerignore`, the
+liveness/readiness split, and graceful shutdown. See `server/RUNNING.md`.
+
+Three deferred decisions are now resolved:
+
+1. **Max context ceiling — 1024 by default**, as the `-context` / `CONTEXT`
+   default. ~29 MB per worker, so four workers cost ~116 MB. Raising it is a
+   flag, and the startup log prints the estimate before allocating.
+2. **Linking — dynamic.** `CGO_ENABLED=1` makes a static binary impossible
+   anyway, so the runtime image is `debian-bookworm-slim` plus libengine and
+   the five llama.cpp/ggml shared objects, installed to `/usr/local/lib` with
+   `ldconfig`. Not `scratch`.
+3. **Model delivery — mounted, not baked in.** Keeps the image at ~120 MB so
+   rebuilds take seconds, and guarantees replicas on one node share the same
+   inode and therefore the same page cache. Baking it in is correct for a real
+   multi-node cluster and is a two-line change; the tradeoff table is in
+   `server/RUNNING.md`.
+
+**Two structural changes this phase required:**
+
+- **The server now listens before loading the model.** Previously the listener
+  did not exist until loading finished, so a probe during that window got a
+  refused connection — indistinguishable from a crashed pod. The engine is
+  published behind a `RWMutex` once ready, and requests arriving earlier get
+  `503 model is still loading`.
+- **Graceful shutdown on SIGTERM**, draining in-flight requests before closing
+  sessions. This also fixed a pre-existing bug: `main` used `defer` for
+  cleanup, but `ListenAndServe` only returns on error, so those defers never
+  actually ran.
+
+**Liveness must not depend on the model.** A liveness probe that fails during
+the load would have Kubernetes kill the container before it finished starting,
+producing a crash loop that looks like a broken image. `/health/live` therefore
+reports only that the process is alive.
 
 ---
 

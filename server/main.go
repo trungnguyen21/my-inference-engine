@@ -14,9 +14,12 @@ import (
 	"log"
 	"net/http"
 	"os"
+	"os/signal"
 	"runtime"
 	"strconv"
 	"strings"
+	"sync"
+	"syscall"
 	"time"
 
 	"github.com/trungnguyen21/my-own-inference-engine/server/engine"
@@ -77,18 +80,46 @@ type generator interface {
 // and hanging handlers off it (rather than using globals) is the conventional
 // Go shape for this.
 type server struct {
-	// gen is a sessionPool in production. Each in-flight request gets its own
-	// session, and therefore its own KV cache — which is what makes concurrent
-	// requests safe. Sharing one session is what produced garbage output
-	// before Phase 3.
-	gen generator
+	// mu guards the fields that only become known once the model has loaded.
+	// The process starts listening immediately so Kubernetes can tell "still
+	// starting" (readiness 503) from "broken" (connection refused), which it
+	// cannot do if the model loads before the listener exists.
+	mu sync.RWMutex
 
-	workers        int // concurrent requests the pool admits; reported by /health
+	// gen is a sessionPool in production, and nil until loading finishes. Each
+	// in-flight request gets its own session, and therefore its own KV cache —
+	// which is what makes concurrent requests safe. Sharing one session is
+	// what produced garbage output before Phase 3.
+	gen          generator
+	workers      int // concurrent requests the pool admits
+	contextLimit int // the model's own context ceiling
+	maxThreads   int // OpenMP threads per request; see engine.MaxThreads
+
+	// Static configuration, set before serving.
 	maxTokensLimit int // largest max_tokens a request may ask for
 	promptCapacity int // largest prompt in bytes; from engine.PromptCapacity()
-	contextLimit   int // reported by /health
 	sessionContext int // the session's context ceiling, for pre-flight checks
-	maxThreads     int // OpenMP threads per request; see engine.MaxThreads
+}
+
+// ready publishes the loaded engine. Requests are refused until it is called.
+func (s *server) ready(gen generator, workers, contextLimit, maxThreads int) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.gen, s.workers, s.contextLimit, s.maxThreads = gen, workers, contextLimit, maxThreads
+}
+
+// generator returns the loaded engine, or nil while the model is still loading.
+func (s *server) generator() generator {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.gen
+}
+
+// snapshot reads the load-time facts for reporting.
+func (s *server) snapshot() (workers, contextLimit, maxThreads int, loaded bool) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.workers, s.contextLimit, s.maxThreads, s.gen != nil
 }
 
 // writeJSON is shared by every handler. Note the ordering: headers must be set
@@ -115,9 +146,10 @@ func (s *server) writeGenerateError(w http.ResponseWriter, err error) {
 	case errors.Is(err, ErrBusy):
 		// At capacity, not broken. Retry-After gives the client a hint
 		// instead of leaving it to guess.
+		workers, _, _, _ := s.snapshot()
 		w.Header().Set("Retry-After", "1")
 		writeError(w, http.StatusServiceUnavailable,
-			fmt.Sprintf("all %d workers busy; retry shortly", s.workers))
+			fmt.Sprintf("all %d workers busy; retry shortly", workers))
 	case errors.Is(err, context.Canceled), errors.Is(err, context.DeadlineExceeded):
 		// The caller gave up while queued; nobody is left to read a response.
 		log.Printf("request abandoned before a worker was free: %v", err)
@@ -135,13 +167,44 @@ func (s *server) handleHealth(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusMethodNotAllowed, "use GET")
 		return
 	}
-	writeJSON(w, http.StatusOK, map[string]any{
-		"status":              "ok",
-		"workers":             s.workers,
-		"model_context_limit": s.contextLimit,
+	workers, contextLimit, threads, loaded := s.snapshot()
+	status := "ok"
+	code := http.StatusOK
+	if !loaded {
+		status, code = "loading", http.StatusServiceUnavailable
+	}
+	writeJSON(w, code, map[string]any{
+		"status":              status,
+		"workers":             workers,
+		"model_context_limit": contextLimit,
 		"session_context":     s.sessionContext,
-		"omp_threads":         s.maxThreads,
+		"omp_threads":         threads,
 	})
+}
+
+// handleLive answers "is the process alive". It must not depend on the model:
+// a liveness probe that fails during the ~4 s load would make Kubernetes kill
+// the container before it ever finished starting.
+func (s *server) handleLive(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		writeError(w, http.StatusMethodNotAllowed, "use GET")
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"status": "alive"})
+}
+
+// handleReady answers "can this pod serve traffic". False until the model has
+// loaded, which is what keeps requests off a pod that is still starting.
+func (s *server) handleReady(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		writeError(w, http.StatusMethodNotAllowed, "use GET")
+		return
+	}
+	if _, _, _, loaded := s.snapshot(); !loaded {
+		writeJSON(w, http.StatusServiceUnavailable, map[string]any{"status": "loading"})
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"status": "ready"})
 }
 
 // handleGenerate implements POST /generate as specified in API.md.
@@ -173,14 +236,21 @@ func (s *server) handleGenerate(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	gen := s.generator()
+	if gen == nil {
+		w.Header().Set("Retry-After", "5")
+		writeError(w, http.StatusServiceUnavailable, "model is still loading")
+		return
+	}
+
 	if req.Stream {
-		s.streamGenerate(w, r, prompt, req.MaxTokens)
+		s.streamGenerate(w, r, gen, prompt, req.MaxTokens)
 		return
 	}
 
 	var sb strings.Builder
 	start := time.Now()
-	stats, err := s.gen.Generate(r.Context(), prompt, req.MaxTokens, 0,
+	stats, err := gen.Generate(r.Context(), prompt, req.MaxTokens, 0,
 		func(piece string) bool {
 			sb.WriteString(piece)
 			return true
@@ -207,7 +277,7 @@ func (s *server) handleGenerate(w http.ResponseWriter, r *http.Request) {
 // arrives already validated and trimmed, so only the streaming mechanics
 // remain.
 func (s *server) streamGenerate(w http.ResponseWriter, r *http.Request,
-	prompt string, maxTokens int) {
+	gen generator, prompt string, maxTokens int) {
 
 	flusher, ok := w.(http.Flusher)
 	if !ok {
@@ -251,7 +321,7 @@ func (s *server) streamGenerate(w http.ResponseWriter, r *http.Request,
 	// The pool holds a session for this whole call, so `start` measures
 	// generation and excludes any time spent waiting for a free worker.
 	start := time.Now()
-	stats, genErr := s.gen.Generate(r.Context(), prompt, maxTokens, 0, func(piece string) bool {
+	stats, genErr := gen.Generate(r.Context(), prompt, maxTokens, 0, func(piece string) bool {
 		select {
 		case <-clientGone:
 			disconnected = true
@@ -331,12 +401,14 @@ func (s *server) streamGenerate(w http.ResponseWriter, r *http.Request,
 
 func main() {
 	var (
-		modelPath      = flag.String("model", "../models/qwen-2.5.gguf", "path to the GGUF model")
-		addr           = flag.String("addr", ":8080", "listen address")
-		sessionContext = flag.Int("context", 1024, "session context ceiling in tokens (~27.6 KB each)")
+		modelPath = flag.String("model", envStr("MODEL", "../models/qwen-2.5.gguf"),
+			"path to the GGUF model (env: MODEL)")
+		addr           = flag.String("addr", envStr("ADDR", ":8080"), "listen address (env: ADDR)")
+		sessionContext = flag.Int("context", envInt("CONTEXT", 1024),
+			"session context ceiling in tokens, ~27.6 KB each (env: CONTEXT)")
 		maxTokensLimit = flag.Int("max-tokens-limit", 512, "largest max_tokens a request may request")
-		ompThreadsFlag = flag.Int("threads", 0,
-			"OpenMP threads per request (0 = derive from cores/workers)")
+		ompThreadsFlag = flag.Int("threads", envInt("THREADS", 0),
+			"OpenMP threads per request (0 = derive from cores/workers) (env: THREADS)")
 		workers = flag.Int("workers", envInt("WORKERS", 1),
 			"concurrent requests to admit; one session each (env: WORKERS)")
 		queueWait = flag.Duration("queue-wait", 30*time.Second,
@@ -344,19 +416,57 @@ func main() {
 	)
 	flag.Parse()
 
-	// Loading takes ~4.2 s, so do it before listening. Kubernetes will later
-	// need a readiness probe that stays false during this window.
+	srv := &server{
+		maxTokensLimit: *maxTokensLimit,
+		promptCapacity: engine.PromptCapacity(),
+		sessionContext: *sessionContext,
+	}
+
+	mux := http.NewServeMux()
+	mux.HandleFunc("/health", srv.handleHealth)
+	mux.HandleFunc("/health/live", srv.handleLive)
+	mux.HandleFunc("/health/ready", srv.handleReady)
+	mux.HandleFunc("/generate", srv.handleGenerate)
+
+	httpServer := &http.Server{
+		Addr:    *addr,
+		Handler: mux,
+		// Generation is slow, so the write timeout must be generous or long
+		// streaming responses get cut off mid-flight.
+		ReadHeaderTimeout: 5 * time.Second,
+		WriteTimeout:      30 * time.Minute,
+	}
+
+	// Listen before loading. The model takes several seconds, and a pod that
+	// refuses connections during that window is indistinguishable from a
+	// broken one; a pod that answers /health/ready with 503 is not.
+	listening := make(chan error, 1)
+	go func() {
+		log.Printf("listening on %s (readiness 503 until the model is loaded)", *addr)
+		err := httpServer.ListenAndServe()
+		if !errors.Is(err, http.ErrServerClosed) {
+			listening <- err
+			return
+		}
+		listening <- nil
+	}()
+
+	// Shut down on SIGINT/SIGTERM. Kubernetes sends SIGTERM and waits, so
+	// draining here is what lets in-flight generations finish.
+	shutdownCtx, stopSignals := signal.NotifyContext(context.Background(),
+		os.Interrupt, syscall.SIGTERM)
+	defer stopSignals()
+
 	log.Printf("loading %s ...", *modelPath)
+	loadStart := time.Now()
 	model, err := engine.Open(*modelPath)
 	if err != nil {
 		log.Fatalf("load model: %v", err)
 	}
 	defer model.Close()
-	log.Printf("loaded. model context limit = %d tokens", model.ContextLimit())
+	log.Printf("loaded in %s. model context limit = %d tokens",
+		time.Since(loadStart).Round(time.Millisecond), model.ContextLimit())
 
-	// OpenMP lives inside the C++ kernels, so it is invisible from Go unless
-	// reported. Unset means "all cores", which becomes oversubscription once
-	// Phase 3 runs several requests at once: threads = workers * this value.
 	// Threads multiply by workers, so leaving this to the environment is a
 	// trap: 4 workers at "all cores" put 32 threads on 8 cores and turned a
 	// 7 s workload into a 120 s one. Derive a safe default instead.
@@ -397,36 +507,38 @@ func main() {
 	if err != nil {
 		log.Fatalf("create session pool: %v", err)
 	}
-	defer pool.Close()
 
-	srv := &server{
-		gen:            pool,
-		workers:        pool.Workers(),
-		maxTokensLimit: *maxTokensLimit,
-		promptCapacity: engine.PromptCapacity(),
-		contextLimit:   model.ContextLimit(),
-		sessionContext: *sessionContext,
-		maxThreads:     ompThreads,
+	srv.ready(pool, pool.Workers(), model.ContextLimit(), ompThreads)
+	log.Printf("ready: %d worker(s), queue wait %s", pool.Workers(), *queueWait)
+
+	// Wait for a signal, or for the listener to fail.
+	select {
+	case <-shutdownCtx.Done():
+		log.Printf("shutdown signal received; draining")
+	case err := <-listening:
+		if err != nil {
+			log.Printf("serve: %v", err)
+		}
 	}
 
-	mux := http.NewServeMux()
-	mux.HandleFunc("/health", srv.handleHealth)
-	mux.HandleFunc("/generate", srv.handleGenerate)
-
-	httpServer := &http.Server{
-		Addr:    *addr,
-		Handler: mux,
-		// Generation is slow, so the write timeout must be generous or long
-		// responses get cut off mid-flight.
-		ReadHeaderTimeout: 5 * time.Second,
-		WriteTimeout:      10 * time.Minute,
+	// Stop accepting, let in-flight requests finish, then release the engine.
+	// Sessions must outlive every request that holds one, so the pool closes
+	// only after the HTTP server has drained.
+	drainCtx, cancelDrain := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancelDrain()
+	if err := httpServer.Shutdown(drainCtx); err != nil {
+		log.Printf("drain did not finish cleanly: %v", err)
 	}
+	pool.Close()
+	log.Printf("stopped")
+}
 
-	log.Printf("ready: %d worker(s), queue wait %s", srv.workers, *queueWait)
-	log.Printf("listening on %s", *addr)
-	if err := httpServer.ListenAndServe(); err != nil {
-		log.Fatalf("serve: %v", err)
+// envStr reads a string environment variable, falling back to def.
+func envStr(name, def string) string {
+	if raw, ok := os.LookupEnv(name); ok && raw != "" {
+		return raw
 	}
+	return def
 }
 
 // envInt reads an integer environment variable, falling back to def when it is
