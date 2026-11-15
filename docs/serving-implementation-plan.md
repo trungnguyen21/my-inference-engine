@@ -168,13 +168,13 @@ session immediately — the next request answered in 1.2 s instead of waiting
 CJK character can be split across two tokens, so bytes must be buffered and
 decoded incrementally — otherwise output shows replacement characters.
 
-## Phase 3 — Concurrency
+## Phase 3 — Concurrency  ✅ DONE
 
 Handle several requests at once in one process.
 
 **Tasks**
 
-0. **Replace the `sync.Mutex` added in Phase 2.** A single session is not safe
+0. **Replace the `sync.Mutex` added in Phase 2.** (Done.) A single session is not safe
    for concurrent use, but `net/http` runs every request on its own goroutine —
    four simultaneous requests on one shared session returned three errors and
    one **HTTP 200 carrying garbage text** (`",,,,,,......"`). A mutex now
@@ -189,6 +189,29 @@ Handle several requests at once in one process.
 4. `WORKERS` is an environment variable, so the same build runs 1 or 4.
 
 **Done when:** four simultaneous requests stream in parallel on one machine.
+
+**Outcome.** `server/pool.go` holds N sessions in a buffered channel, which is
+simultaneously the pool, the queue and the semaphore. No engine changes were
+needed: `engine_session_create` already produced independent KV caches, and
+Phase 0 had already verified 4-way concurrency.
+
+Verified with four concurrent streaming requests at `-workers 4`: tokens from
+all four interleave within the same ~100 ms window, and each reports ~5 s of
+generation, finishing within 1.9 s of one another. Backpressure also works —
+at `-workers 1 -queue-wait 500ms`, three simultaneous requests gave one `200`
+and two `503`s carrying `Retry-After: 1`.
+
+Three design points worth keeping:
+
+- **The pool implements the `generator` interface**, so `handleGenerate` and
+  `streamGenerate` were untouched and all 37 existing handler tests kept
+  passing — the regression check that behaviour did not change.
+- **Threads are derived, not inherited.** `-workers 4` with no `-threads`
+  computes `cores/workers`, logging `2 threads per request (derived from
+  8 cores / 4 workers)`. Leaving this to the environment was the 7 s -> 120 s
+  cliff; a bad explicit combination now logs a warning.
+- **Release is deferred**, so a panic cannot permanently shrink capacity. That
+  is the pool's worst failure mode and it has a dedicated test.
 
 ### Measured: concurrency buys latency fairness, not throughput
 

@@ -1,7 +1,7 @@
 # Go HTTP server
 
-Phases 1-2 of `docs/serving-implementation-plan.md`. One endpoint, one request
-at a time, with optional streaming via `"stream": true`.
+Phases 1-3 of `docs/serving-implementation-plan.md`. One endpoint, optional
+streaming via `"stream": true`, and a pool of N sessions so requests overlap.
 
 ## What is already done vs. what you write
 
@@ -280,11 +280,38 @@ Client disconnect is handled by returning `false` from the token callback once
 abandoned request frees its session within one token instead of running to
 completion.
 
+## Workers
+
+```sh
+go run . -workers 4                 # or WORKERS=4
+go run . -workers 4 -threads 2      # override the derived thread count
+```
+
+Each worker owns one `engine.Session`, and therefore one KV cache — which is
+what makes concurrency safe. Sharing a single session is what produced
+`",,,,,,......"` at HTTP 200 before this phase.
+
+`pool.go` is a buffered channel of sessions, which is at once the pool (it
+holds idle sessions), the queue (a receive blocks while they are all out) and
+the semaphore (its capacity caps concurrency). That is why there is no mutex:
+a session can only be held by whoever took it out of the channel.
+
+Three behaviours to know:
+
+- **Threads are derived from `cores/workers`** unless `-threads` says
+  otherwise, because `workers x threads` oversubscription is a severe cliff
+  rather than a gentle slope. A bad explicit combination logs a warning.
+- **A saturated server returns 503 with `Retry-After`**, after waiting up to
+  `-queue-wait` (default 30s). At capacity is not the same as broken.
+- **A client that disconnects while queued consumes no worker** — the acquire
+  selects on the request context too.
+
+Remember the measured caveat above: concurrency redistributes latency, it does
+not add throughput on this hardware. What it buys is time-to-first-token, no
+head-of-line blocking, and real backpressure.
+
 ## Next
 
-Phase 3: a pool of N sessions behind a channel, so several requests can be in
-flight at once. `WORKERS` becomes an environment variable, and the bounded
-queue returns 503 on overflow.
-
-Remember the measured caveat above — concurrency redistributes latency, it does
-not add throughput on this hardware.
+Phase 4: container. Multi-stage Dockerfile, `/health/live` + `/health/ready`
+split so Kubernetes can tell "process up" from "model loaded", and a decision
+on how the model reaches the image.

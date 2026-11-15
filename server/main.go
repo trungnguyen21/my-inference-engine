@@ -6,14 +6,17 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
+	"errors"
 	"flag"
 	"fmt"
 	"log"
 	"net/http"
 	"os"
+	"runtime"
+	"strconv"
 	"strings"
-	"sync"
 	"time"
 
 	"github.com/trungnguyen21/my-own-inference-engine/server/engine"
@@ -64,7 +67,9 @@ type streamStats struct {
 // ---------------------------------------------------------------------------
 
 type generator interface {
-	Generate(prompt string, maxTokens int, temperature float32,
+	// ctx carries the HTTP request's lifetime. The pool uses it to stop
+	// waiting for a worker when the client has already hung up.
+	Generate(ctx context.Context, prompt string, maxTokens int, temperature float32,
 		onToken engine.TokenFunc) (engine.Stats, error)
 }
 
@@ -72,18 +77,13 @@ type generator interface {
 // and hanging handlers off it (rather than using globals) is the conventional
 // Go shape for this.
 type server struct {
+	// gen is a sessionPool in production. Each in-flight request gets its own
+	// session, and therefore its own KV cache — which is what makes concurrent
+	// requests safe. Sharing one session is what produced garbage output
+	// before Phase 3.
 	gen generator
 
-	// A single engine.Session is not safe for concurrent use, but net/http
-	// runs every request in its own goroutine. Without this, simultaneous
-	// requests corrupt each other's KV cache and can return a 200 carrying
-	// garbage text.
-	//
-	// Holding it for the whole generation serializes requests, which is what
-	// the one-session design means. Phase 3 replaces this with a pool of
-	// sessions so requests genuinely overlap.
-	mu sync.Mutex
-
+	workers        int // concurrent requests the pool admits; reported by /health
 	maxTokensLimit int // largest max_tokens a request may ask for
 	promptCapacity int // largest prompt in bytes; from engine.PromptCapacity()
 	contextLimit   int // reported by /health
@@ -106,6 +106,26 @@ func writeError(w http.ResponseWriter, status int, message string) {
 	writeJSON(w, status, errorResponse{Error: message})
 }
 
+// writeGenerateError turns an error from the generator into a response.
+//
+// The three cases are distinct on purpose: a client can retry a 503 later, can
+// only report a 500, and needs nothing at all once it has disconnected.
+func (s *server) writeGenerateError(w http.ResponseWriter, err error) {
+	switch {
+	case errors.Is(err, ErrBusy):
+		// At capacity, not broken. Retry-After gives the client a hint
+		// instead of leaving it to guess.
+		w.Header().Set("Retry-After", "1")
+		writeError(w, http.StatusServiceUnavailable,
+			fmt.Sprintf("all %d workers busy; retry shortly", s.workers))
+	case errors.Is(err, context.Canceled), errors.Is(err, context.DeadlineExceeded):
+		// The caller gave up while queued; nobody is left to read a response.
+		log.Printf("request abandoned before a worker was free: %v", err)
+	default:
+		writeError(w, http.StatusInternalServerError, err.Error())
+	}
+}
+
 // ---------------------------------------------------------------------------
 // WORKED EXAMPLE — read this one, then write handleGenerate below.
 // ---------------------------------------------------------------------------
@@ -117,6 +137,7 @@ func (s *server) handleHealth(w http.ResponseWriter, r *http.Request) {
 	}
 	writeJSON(w, http.StatusOK, map[string]any{
 		"status":              "ok",
+		"workers":             s.workers,
 		"model_context_limit": s.contextLimit,
 		"session_context":     s.sessionContext,
 		"omp_threads":         s.maxThreads,
@@ -158,19 +179,15 @@ func (s *server) handleGenerate(w http.ResponseWriter, r *http.Request) {
 	}
 
 	var sb strings.Builder
-	s.mu.Lock()
-	// Started after the lock: `ms` reports generation time, not time spent
-	// queued behind another request.
 	start := time.Now()
-	stats, err := s.gen.Generate(prompt, req.MaxTokens, 0,
+	stats, err := s.gen.Generate(r.Context(), prompt, req.MaxTokens, 0,
 		func(piece string) bool {
 			sb.WriteString(piece)
 			return true
 		})
-	s.mu.Unlock()
 	elapsed := time.Since(start)
 	if err != nil {
-		writeError(w, http.StatusInternalServerError, err.Error())
+		s.writeGenerateError(w, err)
 		return
 	}
 
@@ -231,11 +248,10 @@ func (s *server) streamGenerate(w http.ResponseWriter, r *http.Request,
 	// The callback runs synchronously on this goroutine — Generate blocks in C
 	// and calls back into Go on the same thread — so these closures need no
 	// locking.
-	// Held for the whole stream: one session cannot serve two requests.
-	s.mu.Lock()
-	// Started after the lock, so `ms` excludes time spent queued.
+	// The pool holds a session for this whole call, so `start` measures
+	// generation and excludes any time spent waiting for a free worker.
 	start := time.Now()
-	stats, genErr := s.gen.Generate(prompt, maxTokens, 0, func(piece string) bool {
+	stats, genErr := s.gen.Generate(r.Context(), prompt, maxTokens, 0, func(piece string) bool {
 		select {
 		case <-clientGone:
 			disconnected = true
@@ -261,12 +277,11 @@ func (s *server) streamGenerate(w http.ResponseWriter, r *http.Request,
 		flusher.Flush()
 		return true
 	})
-	s.mu.Unlock()
 
 	if genErr != nil {
 		if !wroteHeader {
 			// Still a normal HTTP error: nothing has been committed yet.
-			writeError(w, http.StatusInternalServerError, genErr.Error())
+			s.writeGenerateError(w, genErr)
 			return
 		}
 		// The status is already sent, so report in-band and send no [DONE] —
@@ -320,7 +335,12 @@ func main() {
 		addr           = flag.String("addr", ":8080", "listen address")
 		sessionContext = flag.Int("context", 1024, "session context ceiling in tokens (~27.6 KB each)")
 		maxTokensLimit = flag.Int("max-tokens-limit", 512, "largest max_tokens a request may request")
-		ompThreadsFlag = flag.Int("threads", 0, "OpenMP threads per request (0 = use OMP_NUM_THREADS / all cores)")
+		ompThreadsFlag = flag.Int("threads", 0,
+			"OpenMP threads per request (0 = derive from cores/workers)")
+		workers = flag.Int("workers", envInt("WORKERS", 1),
+			"concurrent requests to admit; one session each (env: WORKERS)")
+		queueWait = flag.Duration("queue-wait", 30*time.Second,
+			"how long a request may wait for a free worker before 503")
 	)
 	flag.Parse()
 
@@ -337,11 +357,22 @@ func main() {
 	// OpenMP lives inside the C++ kernels, so it is invisible from Go unless
 	// reported. Unset means "all cores", which becomes oversubscription once
 	// Phase 3 runs several requests at once: threads = workers * this value.
+	// Threads multiply by workers, so leaving this to the environment is a
+	// trap: 4 workers at "all cores" put 32 threads on 8 cores and turned a
+	// 7 s workload into a 120 s one. Derive a safe default instead.
 	ompThreads := engine.MaxThreads()
 	switch {
 	case *ompThreadsFlag > 0:
 		ompThreads = engine.SetMaxThreads(*ompThreadsFlag)
 		log.Printf("OpenMP: %d threads per request (-threads=%d)", ompThreads, *ompThreadsFlag)
+	case *workers > 1:
+		derived := runtime.NumCPU() / *workers
+		if derived < 1 {
+			derived = 1
+		}
+		ompThreads = engine.SetMaxThreads(derived)
+		log.Printf("OpenMP: %d threads per request (derived from %d cores / %d workers; "+
+			"pass -threads to override)", ompThreads, runtime.NumCPU(), *workers)
 	default:
 		if env, ok := os.LookupEnv("OMP_NUM_THREADS"); ok {
 			log.Printf("OpenMP: %d threads per request (OMP_NUM_THREADS=%s)", ompThreads, env)
@@ -350,17 +381,27 @@ func main() {
 				"pass -threads to pin it)", ompThreads)
 		}
 	}
-
-	// Phase 1 is one session, so one request at a time. Phase 3 turns this
-	// into a pool of N sessions behind a channel.
-	session, err := model.NewSession(*sessionContext)
-	if err != nil {
-		log.Fatalf("create session: %v", err)
+	if total := ompThreads * *workers; total > runtime.NumCPU() {
+		log.Printf("warning: %d workers x %d threads = %d threads on %d cores; "+
+			"oversubscription degrades throughput superlinearly",
+			*workers, ompThreads, total, runtime.NumCPU())
 	}
-	defer session.Close()
+
+	// Each worker holds its own KV cache, so memory scales with both numbers.
+	// Report the estimate before allocating: failing here with a clear message
+	// beats being OOM-killed halfway through a demo.
+	log.Printf("allocating %d worker(s) x %d context tokens (~%d MiB of KV cache)",
+		*workers, *sessionContext, estimateKVMiB(*workers, *sessionContext))
+
+	pool, err := newSessionPool(model, *workers, *sessionContext, *queueWait)
+	if err != nil {
+		log.Fatalf("create session pool: %v", err)
+	}
+	defer pool.Close()
 
 	srv := &server{
-		gen:            session,
+		gen:            pool,
+		workers:        pool.Workers(),
 		maxTokensLimit: *maxTokensLimit,
 		promptCapacity: engine.PromptCapacity(),
 		contextLimit:   model.ContextLimit(),
@@ -381,8 +422,33 @@ func main() {
 		WriteTimeout:      10 * time.Minute,
 	}
 
+	log.Printf("ready: %d worker(s), queue wait %s", srv.workers, *queueWait)
 	log.Printf("listening on %s", *addr)
 	if err := httpServer.ListenAndServe(); err != nil {
 		log.Fatalf("serve: %v", err)
 	}
+}
+
+// envInt reads an integer environment variable, falling back to def when it is
+// unset or unparseable. Flags still win: the flag default is this value.
+func envInt(name string, def int) int {
+	raw, ok := os.LookupEnv(name)
+	if !ok {
+		return def
+	}
+	n, err := strconv.Atoi(raw)
+	if err != nil || n < 1 {
+		log.Printf("ignoring %s=%q: %v", name, raw, err)
+		return def
+	}
+	return n
+}
+
+// estimateKVMiB approximates the KV cache plus activations a pool will hold.
+//
+// Measured at ~27.6 KB per context token per worker for this model: the KV
+// cache dominates at 2 caches x 24 layers x 128 values x 4 bytes per token.
+func estimateKVMiB(workers, contextTokens int) int {
+	const bytesPerContextToken = 28220
+	return workers * contextTokens * bytesPerContextToken / (1 << 20)
 }

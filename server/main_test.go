@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
@@ -25,15 +26,17 @@ type fakeGenerator struct {
 	// cancel the request context partway through.
 	beforePiece func(i int)
 
-	consumed  int // pieces actually handed to the callback
-	gotMax    int // records what the handler passed through
+	consumed  int             // pieces actually handed to the callback
+	gotCtx    context.Context // the request context the handler passed through
+	gotMax    int             // records what the handler passed through
 	gotTemp   float32
 	gotPrompt string
 }
 
-func (f *fakeGenerator) Generate(prompt string, maxTokens int, temperature float32,
-	onToken engine.TokenFunc) (engine.Stats, error) {
+func (f *fakeGenerator) Generate(ctx context.Context, prompt string, maxTokens int,
+	temperature float32, onToken engine.TokenFunc) (engine.Stats, error) {
 	f.gotPrompt, f.gotMax, f.gotTemp = prompt, maxTokens, temperature
+	f.gotCtx = ctx
 	if f.err != nil {
 		return engine.Stats{}, f.err
 	}
@@ -55,6 +58,7 @@ func (f *fakeGenerator) Generate(prompt string, maxTokens int, temperature float
 func newTestServer(gen generator) *server {
 	return &server{
 		gen:            gen,
+		workers:        1,
 		maxTokensLimit: 512,
 		promptCapacity: 4096,
 		contextLimit:   32768,
