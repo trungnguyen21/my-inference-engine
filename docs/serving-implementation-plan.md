@@ -333,7 +333,7 @@ reports only that the process is alive.
 
 ---
 
-## Phase 5 — Identity and the demo kit  (local, no cluster)
+## Phase 5 — Identity and the demo kit  ✅ DONE  (local, no cluster)
 
 Everything here works against `go run .`, Compose, or any cluster, so none of
 it is wasted if the EC2 step slips. It is also what every later phase depends
@@ -384,6 +384,38 @@ on, which is why it comes first.
    cordoned and then with both.
 
 **Done when:** the dashboard and panes work against a local server.
+
+**Outcome.** `demo/loadgen`, `demo/bench.sh`, `demo/README.md`, and the
+streaming page — plus pod/node identity on every response.
+
+Four decisions worth keeping:
+
+- **The streaming page is served by the server itself** at `/demo`, embedded
+  with `go:embed`. That sidesteps CORS (page and API share an origin) and needs
+  no volume mount, so it works unchanged in a container and behind a NodePort.
+- **`bench.sh` drives `loadgen`** rather than reimplementing it, so request
+  shape and retry accounting cannot drift between the two.
+- **`bench.sh` warms up before measuring.** The first request pays for OpenMP
+  team creation and for faulting the weights into the page cache.
+- **A pod that stops answering is marked, not dropped**, from the tally — so a
+  deletion stays visible instead of silently disappearing.
+
+**Bugs found while building it:**
+
+- A failed listener exited 0, so systemd's `Restart=on-failure` never fired and
+  Kubernetes would have read the container as completed successfully. `main` is
+  now a wrapper over `run() error`.
+- `loadgen` retried connection failures with no backoff: **311,173 failures in
+  20 s** against a dead server. Now 500 ms on 503 and 2 s on hard failure.
+- Requests cancelled by `loadgen`'s own shutdown were counted as failures, so
+  every run ended with a misleading error count. They are now a separate
+  `aborted` outcome that is not tallied.
+
+**Verification note.** The browser extension was unavailable, so the page's DOM
+behaviour is unverified. Its SSE parsing loop was extracted and run under node
+against a real captured stream, which produced the correct text, stats, and
+`[DONE]` — that is the part most likely to be wrong, but a browser check is
+still owed.
 
 ---
 

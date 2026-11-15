@@ -1,0 +1,231 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>Inference engine — concurrent streams</title>
+<style>
+  :root { color-scheme: dark; --bg:#14161a; --panel:#1c1f26; --line:#2b2f38;
+          --text:#e6e8ec; --dim:#8b919e; --accent:#6ee7a8; --warn:#f6b26b;
+          --err:#f08a8a; }
+  * { box-sizing: border-box; }
+  body { margin:0; padding:20px; background:var(--bg); color:var(--text);
+         font:14px/1.5 ui-monospace, SFMono-Regular, Menlo, monospace; }
+  h1 { font-size:15px; font-weight:600; margin:0 0 4px; }
+  .sub { color:var(--dim); font-size:12px; margin-bottom:16px; }
+  .bar { display:flex; gap:8px; align-items:center; margin-bottom:16px; flex-wrap:wrap; }
+  button { font:inherit; padding:6px 14px; border-radius:6px; cursor:pointer;
+           border:1px solid var(--line); background:var(--panel); color:var(--text); }
+  button:hover:not(:disabled) { border-color:var(--accent); }
+  button:disabled { opacity:.45; cursor:default; }
+  label { color:var(--dim); font-size:12px; }
+  input { font:inherit; width:62px; padding:4px 6px; border-radius:5px;
+          border:1px solid var(--line); background:var(--bg); color:var(--text); }
+  .grid { display:grid; grid-template-columns:repeat(auto-fit,minmax(300px,1fr)); gap:12px; }
+  .pane { border:1px solid var(--line); border-radius:8px; background:var(--panel);
+          padding:12px; display:flex; flex-direction:column; min-height:190px; }
+  .head { display:flex; justify-content:space-between; align-items:center;
+          gap:8px; margin-bottom:8px; }
+  .who { font-size:11px; color:var(--dim); overflow:hidden; text-overflow:ellipsis;
+         white-space:nowrap; }
+  .who b { color:var(--accent); font-weight:600; }
+  .dot { width:8px; height:8px; border-radius:50%; background:var(--line); flex:none; }
+  .dot.live { background:var(--accent); }
+  .dot.wait { background:var(--warn); }
+  .dot.err  { background:var(--err); }
+  .out { flex:1; white-space:pre-wrap; word-break:break-word; font-size:13px; }
+  .meta { margin-top:8px; font-size:11px; color:var(--dim); border-top:1px solid var(--line);
+          padding-top:6px; min-height:17px; }
+  .meta.bad { color:var(--err); }
+</style>
+
+<h1>Inference engine — concurrent streams</h1>
+<div class="sub">
+  Each pane opens its own streaming request. The badge shows which
+  <b>pod / node</b> answered — with one replica they all match, with several they
+  should not.
+</div>
+
+<div class="bar">
+  <button id="go">Start all</button>
+  <button id="stop" disabled>Stop</button>
+  <label>panes <input id="panes" type="number" value="4" min="1" max="8"></label>
+  <label>max_tokens <input id="toks" type="number" value="64" min="1" max="512"></label>
+  <span id="note" class="who"></span>
+</div>
+
+<div class="grid" id="grid"></div>
+
+<script>
+// Prompts differ per pane so the outputs are visibly distinct, which makes it
+// obvious the streams are independent rather than one response mirrored.
+const PROMPTS = [
+  "What is the capital of France?",
+  "Name three primary colors.",
+  "What is 2+2?",
+  "What color is the sky?",
+  "Who wrote Hamlet?",
+  "Name a programming language.",
+  "What is the largest planet?",
+  "How many days in a week?",
+];
+
+let controllers = [];
+
+function makePane(i) {
+  const el = document.createElement("div");
+  el.className = "pane";
+  el.innerHTML = `
+    <div class="head">
+      <span class="dot" id="dot${i}"></span>
+      <span class="who" id="who${i}">pane ${i + 1} — idle</span>
+    </div>
+    <div class="out" id="out${i}"></div>
+    <div class="meta" id="meta${i}"></div>`;
+  return el;
+}
+
+// EventSource is GET-only and this endpoint is a POST, so the SSE framing is
+// parsed by hand off a fetch body stream. Events are separated by a blank line.
+async function runPane(i, maxTokens, signal) {
+  const dot = document.getElementById(`dot${i}`);
+  const who = document.getElementById(`who${i}`);
+  const out = document.getElementById(`out${i}`);
+  const meta = document.getElementById(`meta${i}`);
+  out.textContent = "";
+  meta.textContent = "";
+  meta.className = "meta";
+  dot.className = "dot wait";
+  who.textContent = `pane ${i + 1} — connecting`;
+
+  let resp;
+  try {
+    resp = await fetch("/generate", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        prompt: PROMPTS[i % PROMPTS.length],
+        max_tokens: maxTokens,
+        stream: true,
+      }),
+      signal,
+    });
+  } catch (e) {
+    if (signal.aborted) { dot.className = "dot"; who.textContent = `pane ${i+1} — stopped`; return; }
+    dot.className = "dot err";
+    meta.className = "meta bad";
+    meta.textContent = String(e);
+    return;
+  }
+
+  // The header is set on every response, errors included, so a pane can show
+  // which pod refused it and not just which one served it.
+  const served = resp.headers.get("X-Served-By") || "unknown";
+  const [pod, node] = served.includes("/") ? served.split("/") : [served, ""];
+  who.innerHTML = node ? `<b>${node}</b> &middot; ${pod}` : `<b>${pod}</b>`;
+
+  if (!resp.ok) {
+    const body = await resp.text().catch(() => "");
+    dot.className = "dot err";
+    meta.className = "meta bad";
+    meta.textContent = `HTTP ${resp.status} — ${body.slice(0, 120)}`;
+    return;
+  }
+
+  dot.className = "dot live";
+  const reader = resp.body.getReader();
+  const dec = new TextDecoder();
+  let buf = "";
+  let sawDone = false;
+
+  while (true) {
+    let chunk;
+    try {
+      chunk = await reader.read();
+    } catch (e) {
+      break; // aborted
+    }
+    if (chunk.done) break;
+    buf += dec.decode(chunk.value, { stream: true });
+
+    // Split on the blank line that terminates each SSE event.
+    let idx;
+    while ((idx = buf.indexOf("\n\n")) !== -1) {
+      const block = buf.slice(0, idx);
+      buf = buf.slice(idx + 2);
+
+      let name = "", data = "";
+      for (const line of block.split("\n")) {
+        if (line.startsWith("data:")) data = line.slice(5).trim();
+        else if (line.startsWith("event:")) name = line.slice(6).trim();
+      }
+      if (!data) continue;
+
+      if (data === "[DONE]") { sawDone = true; continue; }
+      if (name === "error") {
+        dot.className = "dot err";
+        meta.className = "meta bad";
+        try { meta.textContent = "error: " + JSON.parse(data).error; }
+        catch { meta.textContent = "error: " + data; }
+        continue;
+      }
+      if (name === "stats") {
+        try {
+          const s = JSON.parse(data);
+          meta.textContent =
+            `${s.generated_tokens} tokens in ${s.ms} ms` +
+            (s.truncated ? " (truncated)" : "");
+        } catch {}
+        continue;
+      }
+      try { out.textContent += JSON.parse(data).token; } catch {}
+    }
+  }
+
+  // The absence of [DONE] is how truncation is detected: the server only sends
+  // it on success, so a stream that stops without it was cut short.
+  if (!sawDone && !signal.aborted) {
+    meta.className = "meta bad";
+    meta.textContent += meta.textContent ? "  ·  stream ended without [DONE]"
+                                         : "stream ended without [DONE]";
+    dot.className = "dot err";
+  } else {
+    dot.className = "dot";
+  }
+}
+
+function stopAll() {
+  controllers.forEach(c => c.abort());
+  controllers = [];
+  document.getElementById("go").disabled = false;
+  document.getElementById("stop").disabled = true;
+}
+
+document.getElementById("go").onclick = async () => {
+  stopAll();
+  const n = Math.max(1, Math.min(8, +document.getElementById("panes").value));
+  const toks = Math.max(1, +document.getElementById("toks").value);
+  const grid = document.getElementById("grid");
+  grid.innerHTML = "";
+  for (let i = 0; i < n; i++) grid.appendChild(makePane(i));
+
+  document.getElementById("go").disabled = true;
+  document.getElementById("stop").disabled = false;
+
+  // All panes start together: that simultaneity is the thing being shown.
+  const jobs = [];
+  for (let i = 0; i < n; i++) {
+    const c = new AbortController();
+    controllers.push(c);
+    jobs.push(runPane(i, toks, c.signal));
+  }
+  await Promise.allSettled(jobs);
+  document.getElementById("go").disabled = false;
+  document.getElementById("stop").disabled = true;
+};
+
+document.getElementById("stop").onclick = stopAll;
+
+fetch("/health").then(r => r.json()).then(h => {
+  document.getElementById("note").textContent =
+    `${h.workers} worker(s) · ${h.omp_threads} thread(s)/req · ctx ${h.session_context}` +
+    (h.node ? ` · ${h.node}` : "");
+}).catch(() => {});
+</script>

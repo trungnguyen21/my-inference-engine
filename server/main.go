@@ -7,6 +7,7 @@ package main
 
 import (
 	"context"
+	_ "embed"
 	"encoding/json"
 	"errors"
 	"flag"
@@ -63,6 +64,16 @@ type streamStats struct {
 	Pod             string `json:"pod,omitempty"`
 	Node            string `json:"node,omitempty"`
 }
+
+// demoPage is served at /demo. It is embedded rather than read from disk so
+// the binary stays self-contained — no volume mount, and it works unchanged
+// inside a container and behind a NodePort.
+//
+// Serving it from the server also sidesteps CORS: the page and the API share
+// an origin, so a POST from the page needs no cross-origin headers.
+//
+//go:embed demo.html
+var demoPage []byte
 
 // identity is where this instance is running. In Kubernetes both come from the
 // Downward API; elsewhere the pod falls back to the hostname and the node is
@@ -225,6 +236,15 @@ func (s *server) handleHealth(w http.ResponseWriter, r *http.Request) {
 // handleLive answers "is the process alive". It must not depend on the model:
 // a liveness probe that fails during the ~4 s load would make Kubernetes kill
 // the container before it ever finished starting.
+func (s *server) handleDemo(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		writeError(w, http.StatusMethodNotAllowed, "use GET")
+		return
+	}
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	w.Write(demoPage)
+}
+
 func (s *server) handleLive(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet {
 		writeError(w, http.StatusMethodNotAllowed, "use GET")
@@ -484,6 +504,7 @@ func run() error {
 	mux.HandleFunc("/health/live", srv.handleLive)
 	mux.HandleFunc("/health/ready", srv.handleReady)
 	mux.HandleFunc("/generate", srv.handleGenerate)
+	mux.HandleFunc("/demo", srv.handleDemo)
 
 	httpServer := &http.Server{
 		Addr:    *addr,
