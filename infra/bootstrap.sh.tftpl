@@ -1,0 +1,49 @@
+#!/usr/bin/env bash
+# Instance bootstrap. Progress is logged to /var/log/bootstrap.log and the
+# finish is marked by /opt/engine/BOOTSTRAP_DONE, so the sync script can tell
+# "still installing" from "ready".
+set -euxo pipefail
+exec > >(tee -a /var/log/bootstrap.log) 2>&1
+
+export DEBIAN_FRONTEND=noninteractive
+apt-get update
+apt-get install -y --no-install-recommends \
+    build-essential cmake git curl ca-certificates rsync \
+    libgomp1 pkg-config jq
+
+# Docker, for the container phases.
+install -m 0755 -d /etc/apt/keyrings
+curl -fsSL https://download.docker.com/linux/ubuntu/gpg \
+    -o /etc/apt/keyrings/docker.asc
+chmod a+r /etc/apt/keyrings/docker.asc
+echo "deb [arch=arm64 signed-by=/etc/apt/keyrings/docker.asc] \
+https://download.docker.com/linux/ubuntu $(. /etc/os-release && echo "$VERSION_CODENAME") stable" \
+    > /etc/apt/sources.list.d/docker.list
+apt-get update
+apt-get install -y docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin
+usermod -aG docker ubuntu
+
+# Ubuntu 24.04 ships Go 1.22; server/go.mod needs ${go_version}.
+curl -fsSL "https://go.dev/dl/go${go_version}.linux-arm64.tar.gz" -o /tmp/go.tgz
+rm -rf /usr/local/go
+tar -C /usr/local -xzf /tmp/go.tgz
+rm /tmp/go.tgz
+echo 'export PATH=$PATH:/usr/local/go/bin:$HOME/go/bin' > /etc/profile.d/go.sh
+
+mkdir -p /opt/engine /opt/models
+chown -R ubuntu:ubuntu /opt/engine /opt/models
+
+# Download the model here rather than uploading it: ~469 MiB over a home
+# upload link is slow and would be repeated on every rebuild.
+curl -fL --retry 3 --retry-delay 5 "${model_url}" -o /opt/models/qwen-2.5.gguf
+actual=$(stat -c %s /opt/models/qwen-2.5.gguf)
+if [ "$actual" -ne "${model_bytes}" ]; then
+    echo "FATAL: model is $actual bytes, expected ${model_bytes} (truncated download?)" >&2
+    exit 1
+fi
+chown ubuntu:ubuntu /opt/models/qwen-2.5.gguf
+
+/usr/local/go/bin/go version
+cmake --version | head -1
+touch /opt/engine/BOOTSTRAP_DONE
+echo "bootstrap finished at $(date -Is)"

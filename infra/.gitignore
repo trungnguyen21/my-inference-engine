@@ -1,0 +1,10 @@
+# State can contain sensitive values and is machine-local for this project.
+.terraform/
+.terraform.lock.hcl
+*.tfstate
+*.tfstate.*
+*.tfplan
+# Saved plans are binary and reference a specific state; never commit them.
+tfplan
+# Holds your public IP; harmless but personal.
+terraform.tfvars
