@@ -14,9 +14,18 @@ import (
 // milliseconds instead of loading a 469 MB model. It satisfies the generator
 // interface implicitly — no "implements" declaration needed.
 type fakeGenerator struct {
-	pieces    []string // emitted one per callback call
-	err       error    // returned instead of generating
-	stats     engine.Stats
+	pieces []string // emitted one per callback call
+	err    error    // returned instead of generating anything
+	stats  engine.Stats
+
+	// errAfterPieces fails only once every piece has been handed over, which
+	// is how a mid-stream failure is simulated.
+	errAfterPieces bool
+	// beforePiece runs just before piece i is handed over, letting a test
+	// cancel the request context partway through.
+	beforePiece func(i int)
+
+	consumed  int // pieces actually handed to the callback
 	gotMax    int // records what the handler passed through
 	gotTemp   float32
 	gotPrompt string
@@ -28,10 +37,17 @@ func (f *fakeGenerator) Generate(prompt string, maxTokens int, temperature float
 	if f.err != nil {
 		return engine.Stats{}, f.err
 	}
-	for _, p := range f.pieces {
+	for i, p := range f.pieces {
+		if f.beforePiece != nil {
+			f.beforePiece(i)
+		}
+		f.consumed++
 		if !onToken(p) {
 			break
 		}
+	}
+	if f.errAfterPieces {
+		return engine.Stats{}, errEngineBoom
 	}
 	return f.stats, nil
 }

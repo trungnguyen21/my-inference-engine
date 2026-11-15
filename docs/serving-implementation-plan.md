@@ -125,7 +125,7 @@ POST /generate
 - **Build setup.** The Go code needs to find the headers and `libengine`, via
   `#cgo CFLAGS`/`LDFLAGS` directives. Expect to fight this once, then never again.
 
-## Phase 2 — Streaming
+## Phase 2 — Streaming  ✅ DONE
 
 Same endpoint, `"stream": true` switches it to Server-Sent Events — tokens
 appear one at a time, like ChatGPT.
@@ -147,6 +147,23 @@ appear one at a time, like ChatGPT.
 
 **Done when:** `curl -N` shows words appearing progressively.
 
+**Outcome.** Verified against the real engine: tokens arrive 60-140 ms apart
+with correct SSE framing, and a `stats` event plus `data: [DONE]` close the
+stream. Needed **no C++ changes** — the callback already supported stopping.
+
+Both review decisions held up in practice:
+
+- Headers are withheld until the first token, so a pre-first-token failure is
+  still a real `400`/`500` with a JSON body rather than a `200` carrying an
+  error. Confirmed: a whitespace-only prompt with `"stream": true` returns
+  `400 Content-Type: application/json`.
+- `data: [DONE]` is sent only on success, so its absence marks a truncated
+  stream. A mid-stream failure emits `event: error` and no terminator.
+
+Cancellation works end to end: hanging up on a 200-token request freed the
+session immediately — the next request answered in 1.2 s instead of waiting
+~30 s for the abandoned one to finish.
+
 **Watch out for:** tokens are byte fragments, not characters. A single emoji or
 CJK character can be split across two tokens, so bytes must be buffered and
 decoded incrementally — otherwise output shows replacement characters.
@@ -157,6 +174,11 @@ Handle several requests at once in one process.
 
 **Tasks**
 
+0. **Replace the `sync.Mutex` added in Phase 2.** A single session is not safe
+   for concurrent use, but `net/http` runs every request on its own goroutine —
+   four simultaneous requests on one shared session returned three errors and
+   one **HTTP 200 carrying garbage text** (`",,,,,,......"`). A mutex now
+   serializes them correctly; the pool is what makes them actually overlap.
 1. Create N workers, each owning its own `InferenceState` (memory cost below).
 2. Each worker is a goroutine reading from a channel. `net/http` already runs
    every request in its own goroutine, so the web server stays responsive while

@@ -1,7 +1,7 @@
 # Go HTTP server
 
-Phase 1 of `docs/serving-implementation-plan.md`. One endpoint, one request at
-a time, no streaming.
+Phases 1-2 of `docs/serving-implementation-plan.md`. One endpoint, one request
+at a time, with optional streaming via `"stream": true`.
 
 ## What is already done vs. what you write
 
@@ -9,7 +9,7 @@ a time, no streaming.
 |---|---|
 | `engine/` — cgo bindings to the C++ engine | **done & tested** |
 | `main.go` — wiring, types, `/health` | **done**, read as a worked example |
-| `main.go` — `handleGenerate` | **you write this** |
+| `main.go` — `handleGenerate`, `streamGenerate` | **done** |
 | `API.md` — the contract | the spec you implement against |
 | `main_test.go` — the tests | your checklist; green = done |
 
@@ -255,13 +255,36 @@ sampling. Pass `0` and do not expose the field in your API — see `API.md`.
   stops generation, and `r.Context().Done()` tells you the client hung up, but
   connecting the two is Phase 2 work along with streaming.
 
+## Streaming
+
+```sh
+curl -N -s localhost:8080/generate -H 'content-type: application/json' \
+  -d '{"prompt":"What is the capital of France?","max_tokens":24,"stream":true}'
+```
+
+`-N` disables curl's own buffering; without it you cannot tell whether the
+server is streaming. See `API.md` for the wire format.
+
+Two constraints in `streamGenerate` are worth preserving if you refactor it:
+
+1. **The SSE header is not written until the first token arrives.** Once a
+   status line is sent it cannot be changed, so writing it up front would turn
+   every early failure into a `200` carrying an error body. `wroteHeader`
+   tracks this, and it is why the error branch has two cases.
+2. **`data: [DONE]` is only sent on success.** Its absence is how a client
+   detects truncation, so a mid-stream failure emits `event: error` and no
+   terminator.
+
+Client disconnect is handled by returning `false` from the token callback once
+`r.Context().Done()` closes. The engine honours it between tokens, so an
+abandoned request frees its session within one token instead of running to
+completion.
+
 ## Next
 
-Phase 2 adds `"stream": true` and Server-Sent Events. Two decisions already
-made for it, from the Phase 0 review:
+Phase 3: a pool of N sessions behind a channel, so several requests can be in
+flight at once. `WORKERS` becomes an environment variable, and the bounded
+queue returns 503 on overflow.
 
-1. Do not write the SSE response header until the first token succeeds — that
-   keeps most failures as real 4xx/5xx instead of unreportable mid-stream
-   errors.
-2. Send `data: [DONE]` on success. Its absence is how a client detects a
-   truncated stream.
+Remember the measured caveat above — concurrency redistributes latency, it does
+not add throughput on this hardware.

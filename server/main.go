@@ -8,10 +8,12 @@ package main
 import (
 	"encoding/json"
 	"flag"
+	"fmt"
 	"log"
 	"net/http"
 	"os"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/trungnguyen21/my-own-inference-engine/server/engine"
@@ -25,6 +27,7 @@ import (
 type generateRequest struct {
 	Prompt    string `json:"prompt"`
 	MaxTokens int    `json:"max_tokens"`
+	Stream    bool   `json:"stream"`
 }
 
 type generateResponse struct {
@@ -37,6 +40,18 @@ type generateResponse struct {
 
 type errorResponse struct {
 	Error string `json:"error"`
+}
+
+// Streaming wire types. Each is marshalled into one SSE `data:` field.
+type streamToken struct {
+	Token string `json:"token"`
+}
+
+type streamStats struct {
+	PromptTokens    int   `json:"prompt_tokens"`
+	GeneratedTokens int   `json:"generated_tokens"`
+	Truncated       bool  `json:"truncated"`
+	MS              int64 `json:"ms"`
 }
 
 // ---------------------------------------------------------------------------
@@ -57,7 +72,18 @@ type generator interface {
 // and hanging handlers off it (rather than using globals) is the conventional
 // Go shape for this.
 type server struct {
-	gen            generator
+	gen generator
+
+	// A single engine.Session is not safe for concurrent use, but net/http
+	// runs every request in its own goroutine. Without this, simultaneous
+	// requests corrupt each other's KV cache and can return a 200 carrying
+	// garbage text.
+	//
+	// Holding it for the whole generation serializes requests, which is what
+	// the one-session design means. Phase 3 replaces this with a pool of
+	// sessions so requests genuinely overlap.
+	mu sync.Mutex
+
 	maxTokensLimit int // largest max_tokens a request may ask for
 	promptCapacity int // largest prompt in bytes; from engine.PromptCapacity()
 	contextLimit   int // reported by /health
@@ -98,45 +124,6 @@ func (s *server) handleHealth(w http.ResponseWriter, r *http.Request) {
 }
 
 // handleGenerate implements POST /generate as specified in API.md.
-//
-// Run `go test ./...` as you go — main_test.go encodes every rule below, so a
-// green suite means you are done. Work in this order:
-//
-//  1. Reject anything that is not POST with 405.
-//     http.MethodPost is the constant; see handleHealth for the shape.
-//
-//  2. Decode the body into a generateRequest.
-//     json.NewDecoder(r.Body).Decode(&req) returns an error for malformed
-//     JSON — that is a 400, not a 500. The client sent something bad.
-//
-//  3. Validate, each failure a 400 with a message naming the problem:
-//     - Prompt empty or only whitespace       (strings.TrimSpace)
-//     - len(Prompt) > s.promptCapacity        (bytes, not characters:
-//     len() on a string counts bytes)
-//     - MaxTokens < 1 or > s.maxTokensLimit
-//
-//  4. Collect the output. Generate hands you pieces, not the whole string:
-//
-//     var sb strings.Builder
-//     stats, err := s.gen.Generate(req.Prompt, req.MaxTokens, 0,
-//     func(piece string) bool {
-//     sb.WriteString(piece)
-//     return true // false would stop generation
-//     })
-//
-//     Use strings.Builder, not `out += piece`. String concatenation in a loop
-//     reallocates every time; Builder appends to one growing buffer.
-//
-//     Time it with time.Now() before and time.Since(start) after.
-//
-//  5. If err != nil, respond 500 with err.Error().
-//     (Pre-flight context overflow could be a 400 — see API.md. Optional.)
-//
-//  6. On success, respond 200 with a generateResponse.
-//     Truncated comes from stats.StoppedEarly.
-//     MS is time.Since(start).Milliseconds().
-//
-// Delete the line below once you start.
 func (s *server) handleGenerate(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		writeError(w, http.StatusMethodNotAllowed, "use POST")
@@ -165,13 +152,22 @@ func (s *server) handleGenerate(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	if req.Stream {
+		s.streamGenerate(w, r, prompt, req.MaxTokens)
+		return
+	}
+
 	var sb strings.Builder
+	s.mu.Lock()
+	// Started after the lock: `ms` reports generation time, not time spent
+	// queued behind another request.
 	start := time.Now()
 	stats, err := s.gen.Generate(prompt, req.MaxTokens, 0,
 		func(piece string) bool {
 			sb.WriteString(piece)
 			return true
 		})
+	s.mu.Unlock()
 	elapsed := time.Since(start)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, err.Error())
@@ -188,6 +184,130 @@ func (s *server) handleGenerate(w http.ResponseWriter, r *http.Request) {
 
 	writeJSON(w, http.StatusOK, response)
 
+}
+
+// streamGenerate implements the `"stream": true` path from API.md. The prompt
+// arrives already validated and trimmed, so only the streaming mechanics
+// remain.
+func (s *server) streamGenerate(w http.ResponseWriter, r *http.Request,
+	prompt string, maxTokens int) {
+
+	flusher, ok := w.(http.Flusher)
+	if !ok {
+		writeError(w, http.StatusInternalServerError, "this connection cannot stream")
+		return
+	}
+
+	clientGone := r.Context().Done()
+
+	// Nothing may be written until the first token arrives. Once a status line
+	// is sent it cannot be changed, so writing the SSE header up front would
+	// turn an early engine failure into a 200 carrying an error body.
+	wroteHeader := false
+	disconnected := false
+
+	ensureHeader := func() {
+		if wroteHeader {
+			return
+		}
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.Header().Set("Cache-Control", "no-cache")
+		w.WriteHeader(http.StatusOK)
+		wroteHeader = true
+	}
+
+	// One SSE event: an optional `event:` name line, then `data:`, then the
+	// blank line that terminates it. Without that blank line there is no event.
+	writeEvent := func(name string, payload []byte) error {
+		if name != "" {
+			if _, err := fmt.Fprintf(w, "event: %s\n", name); err != nil {
+				return err
+			}
+		}
+		_, err := fmt.Fprintf(w, "data: %s\n\n", payload)
+		return err
+	}
+
+	// The callback runs synchronously on this goroutine — Generate blocks in C
+	// and calls back into Go on the same thread — so these closures need no
+	// locking.
+	// Held for the whole stream: one session cannot serve two requests.
+	s.mu.Lock()
+	// Started after the lock, so `ms` excludes time spent queued.
+	start := time.Now()
+	stats, genErr := s.gen.Generate(prompt, maxTokens, 0, func(piece string) bool {
+		select {
+		case <-clientGone:
+			disconnected = true
+			return false
+		default:
+		}
+
+		// Marshal rather than format: a piece may contain quotes, backslashes,
+		// or a newline, and a raw newline would split one event into two.
+		payload, err := json.Marshal(streamToken{Token: piece})
+		if err != nil {
+			log.Printf("stream: marshal token: %v", err)
+			return false
+		}
+
+		ensureHeader()
+		if err := writeEvent("", payload); err != nil {
+			// The connection is gone; further writes would fail too.
+			log.Printf("stream: write token: %v", err)
+			disconnected = true
+			return false
+		}
+		flusher.Flush()
+		return true
+	})
+	s.mu.Unlock()
+
+	if genErr != nil {
+		if !wroteHeader {
+			// Still a normal HTTP error: nothing has been committed yet.
+			writeError(w, http.StatusInternalServerError, genErr.Error())
+			return
+		}
+		// The status is already sent, so report in-band and send no [DONE] —
+		// its absence is what tells the client the stream was truncated.
+		if payload, err := json.Marshal(errorResponse{Error: genErr.Error()}); err != nil {
+			log.Printf("stream: marshal error event: %v", err)
+		} else if err := writeEvent("error", payload); err != nil {
+			log.Printf("stream: write error event: %v", err)
+		} else {
+			flusher.Flush()
+		}
+		return
+	}
+
+	if disconnected {
+		return // nobody is left to read a terminator
+	}
+
+	// A request that produced no text still owes the client a valid stream;
+	// generation stopping immediately on EOS is a success, not an error.
+	ensureHeader()
+
+	payload, err := json.Marshal(streamStats{
+		PromptTokens:    stats.PromptTokens,
+		GeneratedTokens: stats.GeneratedTokens,
+		Truncated:       stats.StoppedEarly,
+		MS:              time.Since(start).Milliseconds(),
+	})
+	if err != nil {
+		log.Printf("stream: marshal stats: %v", err)
+		return
+	}
+	if err := writeEvent("stats", payload); err != nil {
+		log.Printf("stream: write stats: %v", err)
+		return
+	}
+	if _, err := fmt.Fprint(w, "data: [DONE]\n\n"); err != nil {
+		log.Printf("stream: write terminator: %v", err)
+		return
+	}
+	flusher.Flush()
 }
 
 // ---------------------------------------------------------------------------
