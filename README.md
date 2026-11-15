@@ -70,6 +70,11 @@ OMP_NUM_THREADS=4 ./build/inference --model models/qwen-2.5.gguf \
   --prompt "Hello" --max-tokens 16 --temperature 0 --top-p 1 --profile
 ```
 
+Any thread count works; tune it for your machine. Leaving `OMP_NUM_THREADS`
+unset means "all cores", which is not necessarily the fastest setting — on an
+8-core M2, four threads beat eight. Measurements and the reason are in
+[server/README.md](server/README.md#openmp-threads).
+
 To build serial CPU kernels, configure with
 `cmake -S . -B build -DENGINE_OPENMP=OFF` and rebuild. Re-enable with
 `-DENGINE_OPENMP=ON`. Both F32 and packed quantized matvecs parallelize their
@@ -100,6 +105,35 @@ and the first token's sampling, decoding, and output. It reports `unavailable`
 if no text is emitted or timing is unavailable. The existing elapsed time and
 throughput cover generation after prefill.
 
+## Serving it over HTTP
+
+`libengine` is also built as a shared library with a stable C ABI
+([include/engine_api.h](include/engine_api.h)), so the engine can be embedded in
+a host process. A Go HTTP server lives in [server/](server/README.md).
+
+```sh
+cmake --build build --target engine      # produces libengine
+cd server && go run . -threads 4
+```
+
+Opaque handles keep the ABI free of internal struct layouts: an `EngineHandle`
+holds the read-only weights and is shared across threads, while an
+`EngineSession` holds one request's KV cache and activations. Sessions are
+reusable with no reallocation, and several can generate concurrently on one
+handle.
+
+One finding worth stating plainly: **concurrency does not increase throughput
+here.** Four simultaneous requests take the same total wall time as four
+sequential ones, because each one independently streams the whole weight set
+from RAM and bandwidth is already the bottleneck. Concurrency changes *when*
+each client gets an answer, not how much work the machine does. The fix for
+throughput is batching — one weight read serving many requests — which is an
+engine change, not a serving change.
+
+Design notes and the phased plan:
+[docs/serving-implementation-plan.md](docs/serving-implementation-plan.md), and
+[docs/why-go.md](docs/why-go.md) for the language choice.
+
 ## Tests
 
 The automated suite contains unit tests and four small integration tests using
@@ -119,9 +153,24 @@ cmake --build build --target forward_reference_test
 ctest --test-dir build -R '^forward_reference_test$' --output-on-failure
 ```
 
-The real-model acceptance executables and CLI smoke test have been removed.
-Older milestone documents retain historical evidence of their results; use
-the commands above for the current automated suite.
+The older real-model acceptance executables and CLI smoke test have been
+removed. Older milestone documents retain historical evidence of their results;
+use the commands above for the current automated suite.
+
+Two further suites exist outside `ctest`, both needing `models/qwen-2.5.gguf`:
+
+```sh
+# C ABI contract: session reuse, cancellation, rejection, 4-way concurrency.
+# Written in C on purpose, which is what proves engine_api.h works from a
+# C toolchain (and therefore from cgo).
+cmake --build build --target engine_api_smoke_test
+./build/engine_api_smoke_test
+
+# Go server. -short skips everything that loads the model.
+cd server
+go test -short ./...   # fast
+go test ./...          # ~17 s, real inference through cgo
+```
 
 ### Quantized matvec microbenchmark
 

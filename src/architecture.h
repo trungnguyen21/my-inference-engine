@@ -48,6 +48,13 @@ typedef int (*ArchitecturePrefillFn)(
 
 typedef void (*ArchitectureStateDestroyFn)(InferenceState *state);
 
+/*
+ * Return an initialized state to position zero so its buffers can serve a new
+ * request without reallocation. Stale KV entries past the reset position are
+ * never read, so only the position bookkeeping needs clearing.
+ */
+typedef void (*ArchitectureStateResetFn)(InferenceState *state);
+
 /* Format one user message plus the assistant-generation prefix. */
 typedef int (*ArchitectureFormatPromptFn)(
     const char *user_prompt,
@@ -70,6 +77,8 @@ struct ArchitectureOps {
     ArchitectureForwardTokenFn forward_token_no_logits;
     /* Append a whole prompt segment and publish only its final logits. */
     ArchitecturePrefillFn prefill_tokens;
+    /* Rewind an initialized state to position zero; reuses existing buffers. */
+    ArchitectureStateResetFn state_reset;
 };
 
 /*

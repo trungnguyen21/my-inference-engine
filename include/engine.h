@@ -1,11 +1,17 @@
 #ifndef INFERENCE_ENGINE_H
 #define INFERENCE_ENGINE_H
 
-#include "app.h"
 #include "metrics.h"
 
 #define TOKEN_TEXT_CAPACITY 257
 #define ENGINE_ERROR_CAPACITY 512
+
+/*
+ * Engine-owned input limits. These bound what any front end may submit, so a
+ * server inherits them rather than a command line's buffer sizes.
+ */
+#define ENGINE_MODEL_PATH_CAPACITY 1024
+#define ENGINE_PROMPT_CAPACITY 4096
 
 typedef struct {
     int dim; // transformer dimension
@@ -31,8 +37,12 @@ typedef struct InferenceState {
     OperationProfile profile; // enable after init; totals accumulate per state
 } InferenceState;
 
-/* Parse GGUF metadata/tensors and retain model/tokenizer data for later steps. */
-int engine_load_model(const AppConfig *config, Model *model,
+/*
+ * Parse GGUF metadata/tensors and retain model/tokenizer data for later steps.
+ * model_path must be NUL-terminated and shorter than
+ * ENGINE_MODEL_PATH_CAPACITY.
+ */
+int engine_load_model(const char *model_path, Model *model,
                       char *error, int error_capacity);
 void engine_unload_model(Model *model);
 
@@ -119,6 +129,14 @@ int engine_prefill_tokens(const Model *model, InferenceState *state,
 
 /* Free all state-owned allocations and clear the caller's InferenceState. */
 void inference_state_destroy(InferenceState *state);
+
+/*
+ * Rewind a successfully initialized state to position zero so it can serve a
+ * new request. Allocations are retained; no memory is freed or acquired. Safe
+ * to call on a state that was never forwarded. Does nothing for a null or
+ * uninitialized state.
+ */
+void inference_state_reset(InferenceState *state);
 
 /*
  * Select one token from the latest logits. Temperature zero uses greedy

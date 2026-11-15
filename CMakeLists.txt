@@ -1,5 +1,8 @@
 cmake_minimum_required(VERSION 3.16)
-project(my_own_inference_engine LANGUAGES CXX)
+# C is enabled so tests/engine_api_smoke_test.c can verify that
+# include/engine_api.h is consumable from a C toolchain, which is what
+# cgo and other FFI hosts use.
+project(my_own_inference_engine LANGUAGES C CXX)
 
 include(FetchContent)
 
@@ -56,10 +59,12 @@ FetchContent_Declare(
 )
 FetchContent_MakeAvailable(llama_cpp)
 
-add_executable(inference
-    src/main.cpp
-    src/app.cpp
+# Engine sources shared by the CLI and the embeddable shared library. The
+# command-line front end (main/app/terminal) is deliberately excluded so a host
+# process linking libengine pulls in no terminal output or argument parsing.
+set(ENGINE_CORE_SOURCES
     src/engine.cpp
+    src/generate.cpp
     src/architecture.cpp
     src/qwen2_architecture.cpp
     src/sampler.cpp
@@ -70,11 +75,37 @@ add_executable(inference
     src/tokenizer.cpp
     src/gguf_reader.cpp
     src/metrics.cpp
+)
+
+add_executable(inference
+    src/main.cpp
+    src/app.cpp
     src/terminal.cpp
+    ${ENGINE_CORE_SOURCES}
 )
 
 target_include_directories(inference PRIVATE include)
 target_link_libraries(inference PRIVATE llama)
+
+# Embeddable build consumed over the C ABI in include/engine_api.h, for example
+# by the Go HTTP server in server/ via cgo.
+add_library(engine SHARED
+    src/engine_api.cpp
+    ${ENGINE_CORE_SOURCES}
+)
+
+set_target_properties(engine PROPERTIES POSITION_INDEPENDENT_CODE ON)
+target_include_directories(engine PUBLIC include)
+target_link_libraries(engine PRIVATE llama)
+
+if(APPLE OR CMAKE_SYSTEM_NAME STREQUAL "Linux")
+    target_compile_definitions(engine PRIVATE _POSIX_C_SOURCE=200809L)
+endif()
+if(MSVC)
+    target_compile_options(engine PRIVATE /W4)
+else()
+    target_compile_options(engine PRIVATE -Wall -Wextra -Wpedantic)
+endif()
 
 if(APPLE OR CMAKE_SYSTEM_NAME STREQUAL "Linux")
     target_compile_definitions(inference PRIVATE _POSIX_C_SOURCE=200809L)
@@ -84,6 +115,18 @@ if(MSVC)
     target_compile_options(inference PRIVATE /W4)
 else()
     target_compile_options(inference PRIVATE -Wall -Wextra -Wpedantic)
+endif()
+
+# Optional C-ABI smoke test; needs models/qwen-2.5.gguf, so it is not
+# registered as a correctness test. Compiled as C on purpose.
+find_package(Threads REQUIRED)
+add_executable(engine_api_smoke_test tests/engine_api_smoke_test.c)
+target_link_libraries(engine_api_smoke_test PRIVATE engine Threads::Threads)
+set_target_properties(engine_api_smoke_test PROPERTIES C_STANDARD 99 C_STANDARD_REQUIRED ON)
+if(MSVC)
+    target_compile_options(engine_api_smoke_test PRIVATE /W4)
+else()
+    target_compile_options(engine_api_smoke_test PRIVATE -Wall -Wextra -Wpedantic)
 endif()
 
 # Optional synthetic microbenchmark; not registered as a correctness test.
@@ -419,7 +462,8 @@ if(BUILD_TESTING)
     )
 
     add_executable(sampler_greedy_test tests/sampler_greedy_test.cpp src/sampler.cpp)
-    add_executable(app_generation_contract_test tests/app_generation_contract_test.cpp src/app.cpp)
+    add_executable(app_generation_contract_test
+        tests/app_generation_contract_test.cpp src/app.cpp src/generate.cpp)
     add_executable(operation_profile_report_test
         tests/operation_profile_report_test.cpp src/terminal.cpp src/metrics.cpp)
     foreach(checkpoint IN ITEMS sampler_greedy_test app_generation_contract_test operation_profile_report_test)
@@ -468,6 +512,7 @@ endif()
 if(ENGINE_OPENMP)
     foreach(engine_target IN ITEMS
         inference
+        engine
         quantized_matvec_benchmark
         tensor_reference_test
         quantized_matvec_reference_test

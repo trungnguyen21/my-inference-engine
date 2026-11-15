@@ -1793,6 +1793,22 @@ static int qwen2_format_prompt(
     return 1;
 }
 
+static void qwen2_state_reset(InferenceState *state)
+{
+    Qwen2InferenceState *private_state;
+
+    if (state == nullptr) {
+        return;
+    }
+    private_state = (Qwen2InferenceState *)state->implementation;
+    if (private_state != nullptr) {
+        /* Attention length derives from token_count, so KV entries beyond it
+         * are unreachable and need no clearing. */
+        private_state->token_count = 0;
+    }
+    state->logits_count = 0;
+}
+
 const ArchitectureOps *qwen2_architecture_ops(void)
 {
     static const ArchitectureOps ops = {
@@ -1804,7 +1820,8 @@ const ArchitectureOps *qwen2_architecture_ops(void)
         qwen2_state_destroy,
         qwen2_format_prompt,
         qwen2_forward_token_no_logits,
-        qwen2_prefill_tokens
+        qwen2_prefill_tokens,
+        qwen2_state_reset
     };
 
     return &ops;

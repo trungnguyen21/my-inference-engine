@@ -53,7 +53,7 @@ static int fail(char *error, int capacity)
     return 0;
 }
 
-int engine_load_model(const AppConfig *, Model *model, char *error, int capacity)
+int engine_load_model(const char *, Model *model, char *error, int capacity)
 {
     ++loaded; events.push_back("load");
     model->implementation = logits; /* Also simulate partial failure ownership. */

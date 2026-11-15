@@ -1,8 +1,8 @@
 #include "app.h"
 
 #include "engine.h"
+#include "generate.h"
 #include "metrics.h"
-#include "operation_timer.h"
 #include "terminal.h"
 
 #include <errno.h>
@@ -12,8 +12,6 @@
 #include <string.h>
 
 #define PROMPT_TOKEN_CAPACITY 32768
-/* Room for the bounded CLI prompt plus the single-user instruction wrapper. */
-#define FORMATTED_PROMPT_CAPACITY (PROMPT_CAPACITY + 512)
 
 static int copy_argument(char *destination, int capacity, const char *source)
 {
@@ -139,28 +137,31 @@ int app_parse_args(int argc, char **argv, AppConfig *config)
     return 0;
 }
 
+static int app_emit_token(const char *text, void *user)
+{
+    (void)user;
+    terminal_print_generated_text(text);
+    return 1; /* The CLI never stops early. */
+}
+
 int app_run(const AppConfig *config)
 {
     Model model;
     InferenceState state;
+    GenerateResult result;
     char error[ENGINE_ERROR_CAPACITY];
-    char formatted_prompt[FORMATTED_PROMPT_CAPACITY];
     int *prompt_token_ids;
     int token_capacity = PROMPT_TOKEN_CAPACITY;
     int prompt_token_count = 0;
-    int generated_tokens = 0;
-    int first_token_recorded = 0;
-    double time_to_first_token_seconds = -1.0;
     int requested_context;
     int model_loaded = 0;
     int state_initialized = 0;
     int exit_code = 1;
-    UsageSnapshot start_usage;
-    UsageSnapshot end_usage;
     UsageSnapshot prompt_start_usage;
 
     memset(&model, 0, sizeof(model));
     memset(&state, 0, sizeof(state));
+    memset(&result, 0, sizeof(result));
     error[0] = '\0';
     prompt_token_ids = (int *)malloc((size_t)token_capacity * sizeof(*prompt_token_ids));
     if (prompt_token_ids == NULL) {
@@ -172,30 +173,17 @@ int app_run(const AppConfig *config)
 
     /* Load GGUF metadata and retain its tensor directory for engine work. */
     model_loaded = 1; /* Cleanup must also handle a partially failed load. */
-    if (!engine_load_model(config, &model, error, sizeof(error))) {
+    if (!engine_load_model(config->model_path, &model, error, sizeof(error))) {
         terminal_print_error(error);
         goto cleanup;
     }
 
     /* First-token latency includes prompt processing, starting with a ready model. */
     metrics_capture(&prompt_start_usage);
-    if (!engine_format_prompt(&model, config->prompt, formatted_prompt,
-                              sizeof(formatted_prompt), error, sizeof(error))) {
+    if (!generate_prepare_prompt(&model, config->prompt, prompt_token_ids,
+                                 token_capacity, &prompt_token_count,
+                                 error, sizeof(error))) {
         terminal_print_error(error);
-        goto cleanup;
-    }
-    if (!tokenizer_encode(&model, formatted_prompt, prompt_token_ids,
-                          token_capacity, &prompt_token_count,
-                          error, sizeof(error))) {
-        terminal_print_error(error);
-        goto cleanup;
-    }
-    if (prompt_token_count < 0 || prompt_token_count > token_capacity) {
-        terminal_print_error("Tokenizer returned an invalid prompt token count.");
-        goto cleanup;
-    }
-    if (prompt_token_count == 0) {
-        terminal_print_error("The prompt must produce at least one token.");
         goto cleanup;
     }
     if (model.config.vocab_size <= 0 || model.config.seq_len <= 0) {
@@ -219,81 +207,21 @@ int app_run(const AppConfig *config)
 
     state.profile.enabled = config->profile;
 
-    /* Qwen2 currently executes the checked prefill batch sequentially; only
-     * the final prompt token produces vocabulary logits. */
-    if (!engine_prefill_tokens(&model, &state, prompt_token_ids,
-                               prompt_token_count, error, sizeof(error))) {
+    if (!generate_run(&model, &state, prompt_token_ids, prompt_token_count,
+                      config->max_tokens, config->temperature, config->top_p,
+                      &prompt_start_usage, app_emit_token, NULL,
+                      &result, error, sizeof(error))) {
         terminal_print_error(error);
         goto cleanup;
     }
     free(prompt_token_ids);
     prompt_token_ids = NULL;
 
-    metrics_capture(&start_usage);
-    while (generated_tokens < config->max_tokens) {
-        int token_id = -1;
-        char token_text[TOKEN_TEXT_CAPACITY];
-        error[0] = '\0';
-
-        if (state.logits == NULL || state.logits_count != model.config.vocab_size) {
-            terminal_print_error("Model forward pass returned invalid logits.");
-            goto cleanup;
-        }
-        int sample_result;
-        {
-            OperationTimer timer(state.profile.enabled, &state.profile.sampling_seconds);
-            sample_result = sampler_sample(state.logits, state.logits_count,
-                                           config->temperature, config->top_p, &token_id,
-                                           error, sizeof(error));
-        }
-        if (!sample_result) {
-            terminal_print_error(error);
-            goto cleanup;
-        }
-        if (token_id < 0 || token_id >= model.config.vocab_size) {
-            terminal_print_error("Sampler returned a token ID outside the vocabulary.");
-            goto cleanup;
-        }
-        if (state.profile.enabled) ++state.profile.sampling_calls;
-        ++generated_tokens;
-        if (tokenizer_is_eos(&model, token_id)) {
-            break;
-        }
-        memset(token_text, 0, sizeof(token_text));
-        if (!tokenizer_decode_one(&model, token_id, token_text,
-                                  TOKEN_TEXT_CAPACITY, error, sizeof(error))) {
-            terminal_print_error(error);
-            goto cleanup;
-        }
-        if (memchr(token_text, '\0', sizeof(token_text)) == NULL) {
-            terminal_print_error("Tokenizer returned an unterminated token string.");
-            goto cleanup;
-        }
-        terminal_print_generated_text(token_text);
-        if (!first_token_recorded && token_text[0] != '\0') {
-            UsageSnapshot first_token_usage;
-            metrics_capture(&first_token_usage);
-            first_token_recorded = 1;
-            if (prompt_start_usage.available && first_token_usage.available &&
-                first_token_usage.wall_seconds >= prompt_start_usage.wall_seconds) {
-                time_to_first_token_seconds =
-                    metrics_elapsed_seconds(&prompt_start_usage, &first_token_usage);
-            }
-        }
-
-        /* Use sampled logits directly on the last step; otherwise decode once. */
-        if (generated_tokens < config->max_tokens &&
-            !engine_forward_token(&model, &state, token_id,
-                                  error, sizeof(error))) {
-            terminal_print_error(error);
-            goto cleanup;
-        }
-    }
-    metrics_capture(&end_usage);
-    terminal_finish_generation(generated_tokens,
-                               metrics_elapsed_seconds(&start_usage, &end_usage),
-                               time_to_first_token_seconds,
-                               &start_usage, &end_usage);
+    terminal_finish_generation(result.generated_tokens,
+                               metrics_elapsed_seconds(&result.start_usage,
+                                                       &result.end_usage),
+                               result.time_to_first_token_seconds,
+                               &result.start_usage, &result.end_usage);
     if (config->profile) terminal_print_operation_profile(&state.profile);
     exit_code = 0;
 
