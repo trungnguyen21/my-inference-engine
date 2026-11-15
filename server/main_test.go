@@ -285,3 +285,55 @@ func TestGenerateSendsTheValidatedPrompt(t *testing.T) {
 		t.Errorf("engine received %q, want %q", fake.gotPrompt, "hello")
 	}
 }
+
+// --- pod/node identity (Phase 5) ------------------------------------------
+
+func TestResponsesCarryPodAndNode(t *testing.T) {
+	srv := newTestServer(&fakeGenerator{
+		pieces: []string{"Paris."},
+		stats:  engine.Stats{PromptTokens: 36, GeneratedTokens: 8},
+	})
+	srv.id = identity{Pod: "engine-abc", Node: "node-2"}
+
+	rec := do(t, srv, http.MethodPost, `{"prompt":"hi","max_tokens":8}`)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200", rec.Code)
+	}
+	if got := rec.Header().Get("X-Served-By"); got != "engine-abc/node-2" {
+		t.Errorf("X-Served-By = %q, want %q", got, "engine-abc/node-2")
+	}
+	var body generateResponse
+	if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil {
+		t.Fatal(err)
+	}
+	if body.Pod != "engine-abc" || body.Node != "node-2" {
+		t.Errorf("pod/node = %q/%q, want engine-abc/node-2", body.Pod, body.Node)
+	}
+}
+
+// The header must be present on failures too, so a demo can show which pod
+// refused a request rather than only which one served it.
+func TestIdentityHeaderPresentOnErrors(t *testing.T) {
+	srv := newTestServer(&fakeGenerator{})
+	srv.id = identity{Pod: "engine-abc", Node: "node-2"}
+
+	rec := do(t, srv, http.MethodPost, `{"prompt":"","max_tokens":8}`) // 400
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400", rec.Code)
+	}
+	if got := rec.Header().Get("X-Served-By"); got != "engine-abc/node-2" {
+		t.Errorf("X-Served-By = %q, want it set on errors too", got)
+	}
+}
+
+func TestIdentityStringFallsBack(t *testing.T) {
+	for _, tc := range []struct{ pod, node, want string }{
+		{"engine-abc", "node-2", "engine-abc/node-2"},
+		{"laptop", "", "laptop"}, // outside Kubernetes there is no node name
+		{"", "", "unknown"},
+	} {
+		if got := (identity{Pod: tc.pod, Node: tc.node}).String(); got != tc.want {
+			t.Errorf("identity{%q,%q}.String() = %q, want %q", tc.pod, tc.node, got, tc.want)
+		}
+	}
+}

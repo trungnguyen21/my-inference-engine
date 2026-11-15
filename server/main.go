@@ -42,6 +42,8 @@ type generateResponse struct {
 	GeneratedTokens int    `json:"generated_tokens"`
 	Truncated       bool   `json:"truncated"`
 	MS              int64  `json:"ms"`
+	Pod             string `json:"pod,omitempty"`
+	Node            string `json:"node,omitempty"`
 }
 
 type errorResponse struct {
@@ -54,10 +56,45 @@ type streamToken struct {
 }
 
 type streamStats struct {
-	PromptTokens    int   `json:"prompt_tokens"`
-	GeneratedTokens int   `json:"generated_tokens"`
-	Truncated       bool  `json:"truncated"`
-	MS              int64 `json:"ms"`
+	PromptTokens    int    `json:"prompt_tokens"`
+	GeneratedTokens int    `json:"generated_tokens"`
+	Truncated       bool   `json:"truncated"`
+	MS              int64  `json:"ms"`
+	Pod             string `json:"pod,omitempty"`
+	Node            string `json:"node,omitempty"`
+}
+
+// identity is where this instance is running. In Kubernetes both come from the
+// Downward API; elsewhere the pod falls back to the hostname and the node is
+// empty.
+//
+// The NODE name is the point: four concurrent streams look identical whether
+// they are served by one machine or two unless the response says which.
+type identity struct {
+	Pod  string
+	Node string
+}
+
+func detectIdentity() identity {
+	pod := envStr("POD_NAME", "")
+	if pod == "" {
+		if host, err := os.Hostname(); err == nil {
+			pod = host
+		}
+	}
+	return identity{Pod: pod, Node: envStr("NODE_NAME", "")}
+}
+
+// String is what goes in the X-Served-By header.
+func (i identity) String() string {
+	switch {
+	case i.Pod == "" && i.Node == "":
+		return "unknown"
+	case i.Node == "":
+		return i.Pod
+	default:
+		return i.Pod + "/" + i.Node
+	}
 }
 
 // ---------------------------------------------------------------------------
@@ -96,9 +133,10 @@ type server struct {
 	maxThreads   int // OpenMP threads per request; see engine.MaxThreads
 
 	// Static configuration, set before serving.
-	maxTokensLimit int // largest max_tokens a request may ask for
-	promptCapacity int // largest prompt in bytes; from engine.PromptCapacity()
-	sessionContext int // the session's context ceiling, for pre-flight checks
+	id             identity // which pod and node this is; see detectIdentity
+	maxTokensLimit int      // largest max_tokens a request may ask for
+	promptCapacity int      // largest prompt in bytes; from engine.PromptCapacity()
+	sessionContext int      // the session's context ceiling, for pre-flight checks
 }
 
 // ready publishes the loaded engine. Requests are refused until it is called.
@@ -175,6 +213,8 @@ func (s *server) handleHealth(w http.ResponseWriter, r *http.Request) {
 	}
 	writeJSON(w, code, map[string]any{
 		"status":              status,
+		"pod":                 s.id.Pod,
+		"node":                s.id.Node,
 		"workers":             workers,
 		"model_context_limit": contextLimit,
 		"session_context":     s.sessionContext,
@@ -209,6 +249,10 @@ func (s *server) handleReady(w http.ResponseWriter, r *http.Request) {
 
 // handleGenerate implements POST /generate as specified in API.md.
 func (s *server) handleGenerate(w http.ResponseWriter, r *http.Request) {
+	// Set before any write: this must also be present on 4xx/5xx, so a demo
+	// can show which pod refused a request, not just which one served it.
+	w.Header().Set("X-Served-By", s.id.String())
+
 	if r.Method != http.MethodPost {
 		writeError(w, http.StatusMethodNotAllowed, "use POST")
 		return
@@ -267,6 +311,8 @@ func (s *server) handleGenerate(w http.ResponseWriter, r *http.Request) {
 		GeneratedTokens: stats.GeneratedTokens,
 		Truncated:       stats.StoppedEarly,
 		MS:              elapsed.Milliseconds(),
+		Pod:             s.id.Pod,
+		Node:            s.id.Node,
 	}
 
 	writeJSON(w, http.StatusOK, response)
@@ -379,6 +425,8 @@ func (s *server) streamGenerate(w http.ResponseWriter, r *http.Request,
 		GeneratedTokens: stats.GeneratedTokens,
 		Truncated:       stats.StoppedEarly,
 		MS:              time.Since(start).Milliseconds(),
+		Pod:             s.id.Pod,
+		Node:            s.id.Node,
 	})
 	if err != nil {
 		log.Printf("stream: marshal stats: %v", err)
@@ -400,6 +448,14 @@ func (s *server) streamGenerate(w http.ResponseWriter, r *http.Request,
 // ---------------------------------------------------------------------------
 
 func main() {
+	// A thin wrapper over run so that deferred cleanup still happens on the
+	// error path: log.Fatal calls os.Exit, which skips defers.
+	if err := run(); err != nil {
+		log.Fatalf("fatal: %v", err)
+	}
+}
+
+func run() error {
 	var (
 		modelPath = flag.String("model", envStr("MODEL", "../models/qwen-2.5.gguf"),
 			"path to the GGUF model (env: MODEL)")
@@ -417,6 +473,7 @@ func main() {
 	flag.Parse()
 
 	srv := &server{
+		id:             detectIdentity(),
 		maxTokensLimit: *maxTokensLimit,
 		promptCapacity: engine.PromptCapacity(),
 		sessionContext: *sessionContext,
@@ -457,11 +514,12 @@ func main() {
 		os.Interrupt, syscall.SIGTERM)
 	defer stopSignals()
 
+	log.Printf("identity: %s", srv.id)
 	log.Printf("loading %s ...", *modelPath)
 	loadStart := time.Now()
 	model, err := engine.Open(*modelPath)
 	if err != nil {
-		log.Fatalf("load model: %v", err)
+		return fmt.Errorf("load model: %w", err)
 	}
 	defer model.Close()
 	log.Printf("loaded in %s. model context limit = %d tokens",
@@ -505,20 +563,21 @@ func main() {
 
 	pool, err := newSessionPool(model, *workers, *sessionContext, *queueWait)
 	if err != nil {
-		log.Fatalf("create session pool: %v", err)
+		return fmt.Errorf("create session pool: %w", err)
 	}
 
 	srv.ready(pool, pool.Workers(), model.ContextLimit(), ompThreads)
 	log.Printf("ready: %d worker(s), queue wait %s", pool.Workers(), *queueWait)
 
 	// Wait for a signal, or for the listener to fail.
+	var serveErr error
 	select {
 	case <-shutdownCtx.Done():
 		log.Printf("shutdown signal received; draining")
-	case err := <-listening:
-		if err != nil {
-			log.Printf("serve: %v", err)
-		}
+	case serveErr = <-listening:
+		// A failed listener must not look like a clean exit, or systemd's
+		// Restart=on-failure never fires and Kubernetes reads the container as
+		// having completed successfully.
 	}
 
 	// Stop accepting, let in-flight requests finish, then release the engine.
@@ -531,6 +590,11 @@ func main() {
 	}
 	pool.Close()
 	log.Printf("stopped")
+
+	if serveErr != nil {
+		return fmt.Errorf("serve: %w", serveErr)
+	}
+	return nil
 }
 
 // envStr reads a string environment variable, falling back to def.
