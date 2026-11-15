@@ -28,6 +28,18 @@ spec:
       labels:
         app: engine
     spec:
+      # The CPU request below is deliberately small, so nothing else stops the
+      # scheduler from packing 3 pods onto one node — 6 threads fighting over
+      # 4 vCPUs while the other node idles. This constraint pins the balance:
+      # pod counts per node may differ by at most 1, i.e. exactly 2 + 2.
+      topologySpreadConstraints:
+        - maxSkew: 1
+          topologyKey: kubernetes.io/hostname
+          whenUnsatisfiable: DoNotSchedule
+          labelSelector:
+            matchLabels:
+              app: engine
+
       # Runs to completion before the engine container is allowed to start.
       # Waits (rather than downloads) so 4 replicas cannot fetch the model 4
       # times; the DaemonSet stays the single writer, this is just a latch.

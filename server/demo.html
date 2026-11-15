@@ -4,7 +4,11 @@
 <style>
   :root { color-scheme: dark; --bg:#14161a; --panel:#1c1f26; --line:#2b2f38;
           --text:#e6e8ec; --dim:#8b919e; --accent:#6ee7a8; --warn:#f6b26b;
-          --err:#f08a8a; }
+          --err:#f08a8a;
+          /* Panes are a fixed height so the grid does not reflow as output
+             arrives. A growing pane makes every other pane jump, which is
+             exactly the wrong thing while you are watching four at once. */
+          --pane-h:280px; }
   * { box-sizing: border-box; }
   body { margin:0; padding:20px; background:var(--bg); color:var(--text);
          font:14px/1.5 ui-monospace, SFMono-Regular, Menlo, monospace; }
@@ -20,9 +24,10 @@
           border:1px solid var(--line); background:var(--bg); color:var(--text); }
   .grid { display:grid; grid-template-columns:repeat(auto-fit,minmax(300px,1fr)); gap:12px; }
   .pane { border:1px solid var(--line); border-radius:8px; background:var(--panel);
-          padding:12px; display:flex; flex-direction:column; min-height:190px; }
+          padding:12px; display:flex; flex-direction:column;
+          height:var(--pane-h); }
   .head { display:flex; justify-content:space-between; align-items:center;
-          gap:8px; margin-bottom:8px; }
+          gap:8px; margin-bottom:8px; flex:none; }
   .who { font-size:11px; color:var(--dim); overflow:hidden; text-overflow:ellipsis;
          white-space:nowrap; }
   .who b { color:var(--accent); font-weight:600; }
@@ -30,9 +35,20 @@
   .dot.live { background:var(--accent); }
   .dot.wait { background:var(--warn); }
   .dot.err  { background:var(--err); }
-  .out { flex:1; white-space:pre-wrap; word-break:break-word; font-size:13px; }
+  .out { flex:1; white-space:pre-wrap; word-break:break-word; font-size:13px;
+          overflow-y:auto; overscroll-behavior:contain;
+          /* min-height:0 is load-bearing. A flex item will not shrink below
+             its content size by default, so without it the pane grows to fit
+             the text and overflow-y never engages. */
+          min-height:0;
+          scrollbar-width:thin; scrollbar-color:var(--line) transparent; }
+  .out::-webkit-scrollbar { width:8px; }
+  .out::-webkit-scrollbar-track { background:transparent; }
+  .out::-webkit-scrollbar-thumb { background:var(--line); border-radius:4px; }
+  .out::-webkit-scrollbar-thumb:hover { background:#3a3f4a; }
   .meta { margin-top:8px; font-size:11px; color:var(--dim); border-top:1px solid var(--line);
-          padding-top:6px; min-height:17px; display:flex; gap:10px; flex-wrap:wrap; }
+          padding-top:6px; min-height:17px; display:flex; gap:10px; flex-wrap:wrap;
+          flex:none; }
   .meta.bad { color:var(--err); }
   .meta b { color:var(--text); font-weight:600; }
   .ttft b { color:var(--accent); }
@@ -50,6 +66,7 @@
   <button id="go">Start all</button>
   <button id="stop" disabled>Stop</button>
   <label>panes <input id="panes" type="number" value="4" min="1" max="8"></label>
+  <label>pane height <input id="paneh" type="number" value="280" min="140" max="900" step="20"></label>
   <label>max_tokens <input id="toks" type="number" value="64" min="1" max="512"></label>
   <span id="note" class="who"></span>
 </div>
@@ -191,7 +208,18 @@ async function runPane(i, maxTokens, signal) {
         continue;
       }
       try {
+        // Decide whether to follow BEFORE appending: once the text is in, the
+        // scroll metrics have already changed. A small tolerance keeps it
+        // sticky when the user is within a line or two of the bottom.
+        const following =
+          out.scrollHeight - out.scrollTop - out.clientHeight < 24;
+
         out.textContent += JSON.parse(data).token;
+
+        // Only auto-scroll if they were already at the bottom. Yanking the
+        // view back while someone is reading earlier output is worse than not
+        // following at all.
+        if (following) out.scrollTop = out.scrollHeight;
         // Report TTFT the moment it is known. Waiting for the stats event
         // would hide the single most interesting number until the end.
         if (firstTokenAt === null) {
@@ -246,6 +274,13 @@ document.getElementById("go").onclick = async () => {
 };
 
 document.getElementById("stop").onclick = stopAll;
+
+// Pane height is adjustable because the useful size depends on max_tokens: a
+// 64-token answer fits in 280px, a 512-token one does not.
+document.getElementById("paneh").oninput = (e) => {
+  const h = Math.max(140, Math.min(900, +e.target.value || 280));
+  document.documentElement.style.setProperty("--pane-h", h + "px");
+};
 
 fetch("/health").then(r => r.json()).then(h => {
   document.getElementById("note").textContent =
