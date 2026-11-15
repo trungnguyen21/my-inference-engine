@@ -1,0 +1,19 @@
+# The Kubernetes counterpart of compose.yaml's nginx `gateway` — except there
+# is nothing to configure. A Service is a stable virtual IP plus a live list of
+# every pod whose labels match AND whose readiness probe currently passes.
+# Pods come and go; the Service membership updates by itself.
+apiVersion: v1
+kind: Service
+metadata:
+  name: engine
+spec:
+  type: NodePort
+  selector:
+    app: engine
+  ports:
+    - port: 8080
+      targetPort: 8080
+      # Fixed instead of auto-assigned so the k3d port mapping, the demo kit,
+      # and later the EC2 security group all agree on one number. NodePort
+      # rather than Ingress because ingress proxies buffer SSE streams.
+      nodePort: 30080

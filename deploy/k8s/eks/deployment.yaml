@@ -1,0 +1,112 @@
+# EKS variant of ../deployment.yaml. Same object, four deliberate differences:
+#
+#   1. image: pulled from ECR (nodes authenticate via their IAM role), not
+#      sideloaded with `k3d image import`.
+#   2. replicas 4 x THREADS 2 instead of 2 x 4: the 2-node c7g.xlarge budget
+#      is 8 vCPUs, and 4 x 2 trades some per-stream speed for 4 genuinely
+#      concurrent streams — the multi-panel dashboard layout.
+#   3. an initContainer gates startup on the model file, because the
+#      model-download DaemonSet races the scheduler on a fresh node.
+#   4. hostPath is Directory (strict) — creating it is the DaemonSet's job.
+#
+# Everything not commented here is explained in ../deployment.yaml.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: engine
+spec:
+  replicas: 4
+  selector:
+    matchLabels:
+      app: engine
+  strategy:
+    rollingUpdate:
+      maxSurge: 1
+      maxUnavailable: 0
+  template:
+    metadata:
+      labels:
+        app: engine
+    spec:
+      # Runs to completion before the engine container is allowed to start.
+      # Waits (rather than downloads) so 4 replicas cannot fetch the model 4
+      # times; the DaemonSet stays the single writer, this is just a latch.
+      initContainers:
+        - name: wait-for-model
+          image: busybox:1.37
+          command:
+            - sh
+            - -c
+            - |
+              until [ "$(wc -c < /models/qwen-2.5.gguf 2>/dev/null || echo 0)" = "491400032" ]; do
+                echo "waiting for model download..."
+                sleep 5
+              done
+          volumeMounts:
+            - name: models
+              mountPath: /models
+              readOnly: true
+
+      containers:
+        - name: engine
+          image: 327319899002.dkr.ecr.ca-central-1.amazonaws.com/inference-engine:dev
+          imagePullPolicy: IfNotPresent
+
+          ports:
+            - containerPort: 8080
+
+          env:
+            - name: MODEL
+              value: /models/qwen-2.5.gguf
+            - name: WORKERS
+              value: "1"
+            - name: CONTEXT
+              value: "2048"
+            # 4 replicas x 1 worker x 2 threads = 8 threads on 8 vCPUs.
+            - name: THREADS
+              value: "2"
+            - name: POD_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+            - name: NODE_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: spec.nodeName
+
+          volumeMounts:
+            - name: models
+              mountPath: /models
+              readOnly: true
+
+          resources:
+            requests:
+              memory: 256Mi
+              # Half the k3d request, matching the halved THREADS: two pods
+              # must fit per 4-vCPU node with room for system pods.
+              cpu: 250m
+            limits:
+              memory: 900Mi
+
+          readinessProbe:
+            httpGet:
+              path: /health/ready
+              port: 8080
+            periodSeconds: 2
+            failureThreshold: 2
+
+          livenessProbe:
+            httpGet:
+              path: /health/live
+              port: 8080
+            initialDelaySeconds: 10
+            periodSeconds: 10
+            failureThreshold: 3
+
+      volumes:
+        - name: models
+          hostPath:
+            path: /models
+            type: Directory
+
+      terminationGracePeriodSeconds: 65

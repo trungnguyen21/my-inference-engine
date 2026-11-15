@@ -1,0 +1,63 @@
+# Gets the model onto every node — the job bootstrap.sh.tftpl does for the
+# plain-EC2 setup, expressed as a Kubernetes object.
+#
+# A DaemonSet is a controller with a different contract from a Deployment:
+# not "keep N replicas somewhere" but "keep exactly one copy on EVERY node".
+# "Each node needs the model file" is a per-node fact, so this is the fit.
+# When a node is added during the demo, the DaemonSet runs there unprompted.
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: model-download
+spec:
+  selector:
+    matchLabels:
+      app: model-download
+  template:
+    metadata:
+      labels:
+        app: model-download
+    spec:
+      containers:
+        - name: download
+          image: busybox:1.37
+          command:
+            - sh
+            - -c
+            # Idempotent: a correct-size file short-circuits, so node reboots
+            # and pod restarts don't re-pull 469 MiB. A wrong size (truncated
+            # earlier attempt) is deleted and fetched again — same loud-failure
+            # stance as the Terraform bootstrap's byte check.
+            #
+            # The trailing sleep is because DaemonSet pods must keep running;
+            # a completed pod would be "crashed" and restarted forever. The
+            # sleeping pod doubles as a marker that the node is provisioned.
+            - |
+              set -eu
+              want=491400032
+              f=/models/qwen-2.5.gguf
+              have=$(wc -c < "$f" 2>/dev/null || echo 0)
+              if [ "$have" != "$want" ]; then
+                rm -f "$f"
+                wget -O "$f.tmp" "https://huggingface.co/Qwen/Qwen2.5-0.5B-Instruct-GGUF/resolve/main/qwen2.5-0.5b-instruct-q4_k_m.gguf"
+                [ "$(wc -c < "$f.tmp")" = "$want" ] || { echo "truncated download"; exit 1; }
+                mv "$f.tmp" "$f"
+              fi
+              echo "model present ($want bytes)"
+              sleep infinity
+          volumeMounts:
+            - name: models
+              mountPath: /models
+          resources:
+            requests:
+              cpu: 50m
+              memory: 32Mi
+            limits:
+              memory: 128Mi
+      volumes:
+        - name: models
+          hostPath:
+            path: /models
+            # DirectoryOrCreate, unlike the engine's plain Directory: this is
+            # the object whose job is to bring the directory into existence.
+            type: DirectoryOrCreate
