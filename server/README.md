@@ -3,6 +3,24 @@
 Phases 1-3 of `docs/serving-implementation-plan.md`. One endpoint, optional
 streaming via `"stream": true`, and a pool of N sessions so requests overlap.
 
+## Request lifecycle
+
+One `/generate` request crosses two thread pools that do not know about each
+other: Go's goroutine scheduler admits it through a channel used as a
+semaphore (`pool.go`), then a single cgo call hands it to the C++ engine,
+where OpenMP fans it out across its own thread team.
+
+![Request lifecycle: three requests hit the session pool; two acquire a session and fan out into OpenMP threads, one queues and times out into a 503](../media/server.png)
+
+Reading it top to bottom: each request gets its own goroutine for free from
+`net/http`. The pool is a buffered channel of `*engine.Session` — receiving
+(`<-idle`) acquires a session and its private KV cache, and when the channel
+is empty the receive blocks, which is the queue. A queued request waits at a
+three-way `select`: a session frees up, the client hangs up (`ctx.Done()`), or
+`-queue-wait` expires into a 503. Once acquired, the session is held across
+the whole cgo call — including every OpenMP-parallel kernel — and
+`defer release(session)` returns it to the channel even on panic.
+
 ## What is already done vs. what you write
 
 | | Status |
@@ -310,8 +328,54 @@ Remember the measured caveat above: concurrency redistributes latency, it does
 not add throughput on this hardware. What it buys is time-to-first-token, no
 head-of-line blocking, and real backpressure.
 
-## Next
+## Infra: running more than one of these
 
-Phase 4: container. Multi-stage Dockerfile, `/health/live` + `/health/ready`
-split so Kubernetes can tell "process up" from "model loaded", and a decision
-on how the model reaches the image.
+Everything above happens inside one process. The repo has three ways to run
+several of them, each adding guarantees the previous one lacks. The thread
+budget multiplies across all of them: `replicas x workers x threads` must stay
+at or under the cores actually available.
+
+### Docker Compose (`../compose.yaml`)
+
+Two replicas on one host, behind an nginx gateway (`../deploy/nginx.conf`):
+
+```sh
+docker compose up --build          # from the repo root
+```
+
+- The gateway exists because scaled replicas cannot each publish the same
+  host port. It balances with `least_conn` (queue depth beats round-robin
+  when requests take seconds) and `proxy_buffering off` so SSE tokens reach
+  the client one by one instead of in a burst at the end.
+- Replicas share one set of model pages: the engine mmaps the weights
+  read-only, so the kernel's page cache holds a single copy.
+- What Compose cannot do, which is the argument for Kubernetes: no readiness
+  gating (a replica still inside its ~4 s model load already receives
+  traffic), no rolling updates, no reconciliation loop.
+
+### k3d / Kubernetes (`../deploy/k8s/`)
+
+The same two processes, with the platform closing those gaps:
+
+```sh
+k3d image import inference-engine:dev   # the image is not in a registry
+kubectl apply -f deploy/k8s/
+```
+
+- `deployment.yaml` is a reconciliation loop, not a run command: kill a pod
+  and the controller restores `replicas: 2`. Rolling updates surge one pod up
+  and never dip below the count.
+- `service.yaml` replaces the nginx gateway with nothing to configure: a
+  stable address whose membership is every pod matching `app: engine` *and*
+  currently passing its readiness probe. The `/health/live` vs
+  `/health/ready` split finally does something here — loading pods get no
+  traffic, and a busy pod is not restarted just for being busy.
+- NodePort 30080 rather than Ingress, because ingress proxies buffer SSE.
+- `POD_NAME`/`NODE_NAME` come from the Downward API instead of being set by
+  hand as in Compose.
+
+### EKS (`../infra/`)
+
+Terraform for the same manifests on real AWS nodes; the bootstrap script
+downloads the model to `/models` on every node, matching the `hostPath`
+volume the deployment expects. See `../deploy/k8s/eks/`.
