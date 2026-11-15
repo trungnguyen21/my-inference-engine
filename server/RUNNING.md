@@ -56,6 +56,30 @@ engine's own libraries. `debian-bookworm-slim` plus the six shared objects is
 the honest minimum. Static linking llama.cpp and OpenMP would allow a smaller
 base, but it is fiddly and was deliberately not attempted.
 
+## 2b. Several replicas on one host
+
+```sh
+docker compose up -d --build        # 2 replicas + an nginx gateway on :8080
+docker compose up -d --scale engine=4
+open http://localhost:8080/demo
+cd demo && go run ./loadgen -url http://localhost:8080 -users 4
+```
+
+The gateway exists because Compose cannot publish one host port across scaled
+replicas. Two settings in `deploy/nginx.conf` matter:
+
+- **`proxy_buffering off`** — streaming is the point of this server, and nginx
+  buffers proxied responses by default, which would make tokens arrive in one
+  burst and silently break the demo.
+- **`zone engine_pool 64k`** — required for `resolve`, or nginx refuses to
+  start. With it, re-scaling is picked up without restarting the proxy.
+
+**Measured limitation.** `docker compose restart` under load lost **22 of 64
+requests (34 %)**, all HTTP 502 with "no live upstreams": Compose stops every
+replica at once, and nginx open-source does no active health checking, so the
+healthcheck gates nothing. Kubernetes' `rollout restart` replaces pods one at a
+time behind readiness probes instead. That contrast is the reason for Phase 7.
+
 ## 3. Health endpoints
 
 | Endpoint | Means | Fails when |

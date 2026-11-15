@@ -419,7 +419,7 @@ still owed.
 
 ---
 
-## Phase 6 — Docker Compose  (one host)
+## Phase 6 — Docker Compose  ✅ DONE  (one host)
 
 A deliberate stepping stone, not a detour. ~20 lines, no cost, and it isolates
 "is the image right" from "is the cluster right".
@@ -432,6 +432,48 @@ A deliberate stepping stone, not a detour. ~20 lines, no cost, and it isolates
    labels.
 
 **Done when:** `docker compose up --scale engine=4` serves the dashboard.
+
+**Outcome.** `compose.yaml` plus `deploy/nginx.conf`. Image is **140 MiB,
+linux/arm64**. Two replicas behind an nginx gateway split traffic evenly
+(5/5 over ten requests, 14/14 over a 30 s loadgen run), and `loadgen` shows
+both pods grouped under one node.
+
+Streaming survives the proxy: tokens arrive ~50 ms apart through nginx, because
+`proxy_buffering off` is set. Leaving it on is the silent failure where the
+whole answer lands at once.
+
+**The image did not build on the first attempt.** llama.cpp's ggml-cpu failed
+with `inlining failed in call to always_inline vfmaq_f16: target specific
+option mismatch` — ggml probed the build host's CPU and produced a `-march`
+string enabling fp16 vector arithmetic without enabling fp16 itself. Fixed with
+`-DGGML_NATIVE=OFF`, which is the more correct choice anyway: this image is
+built in a Linux VM on an Apple M2 and will run on Graviton, so baking
+host-detected CPU features in risks illegal instructions. It costs nothing,
+because llama.cpp is used only for its tokenizer.
+
+**nginx needed a shared-memory zone.** `server engine:8080 resolve` requires
+`zone engine_pool 64k`, or nginx refuses to start. With it, scaling via
+`docker compose up --scale engine=N` is picked up without restarting the proxy.
+
+### Measured: what Compose cannot do
+
+A restart under load, with `loadgen` running 4 concurrent users:
+
+```
+ran 55s: 42 ok, 0 busy, 22 failed, 336 tokens
+nginx:   22 x HTTP 502, "no live upstreams" x21
+```
+
+**34 % of requests failed.** `docker compose restart` stopped *both* replicas at
+once — they came back with identical uptime — leaving a window with zero
+backends. There is no `maxUnavailable`, no waiting for a replacement to be
+ready, and nginx open-source does no active health checking, so the healthcheck
+that correctly marked the containers unhealthy gated nothing.
+
+Under Kubernetes the same operation is `kubectl rollout restart`, which replaces
+pods one at a time and will not route to one until its readiness probe passes.
+That contrast — 34 % failures versus ~0 — is the single clearest demonstration
+of what an orchestrator buys, and it is worth filming both halves.
 
 **What Compose cannot do** — worth seeing first-hand, because it is the
 argument for the next phase:
