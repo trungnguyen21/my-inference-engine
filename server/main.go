@@ -43,8 +43,12 @@ type generateResponse struct {
 	GeneratedTokens int    `json:"generated_tokens"`
 	Truncated       bool   `json:"truncated"`
 	MS              int64  `json:"ms"`
-	Pod             string `json:"pod,omitempty"`
-	Node            string `json:"node,omitempty"`
+	// TTFTMs is measured by the engine from prompt processing through the first
+	// emitted piece, so it includes tokenization and prefill but not model
+	// load. Omitted when the request produced no text.
+	TTFTMs int64  `json:"ttft_ms,omitempty"`
+	Pod    string `json:"pod,omitempty"`
+	Node   string `json:"node,omitempty"`
 }
 
 type errorResponse struct {
@@ -57,12 +61,16 @@ type streamToken struct {
 }
 
 type streamStats struct {
-	PromptTokens    int    `json:"prompt_tokens"`
-	GeneratedTokens int    `json:"generated_tokens"`
-	Truncated       bool   `json:"truncated"`
-	MS              int64  `json:"ms"`
-	Pod             string `json:"pod,omitempty"`
-	Node            string `json:"node,omitempty"`
+	PromptTokens    int   `json:"prompt_tokens"`
+	GeneratedTokens int   `json:"generated_tokens"`
+	Truncated       bool  `json:"truncated"`
+	MS              int64 `json:"ms"`
+	// TTFTMs is measured by the engine from prompt processing through the first
+	// emitted piece, so it includes tokenization and prefill but not model
+	// load. Omitted when the request produced no text.
+	TTFTMs int64  `json:"ttft_ms,omitempty"`
+	Pod    string `json:"pod,omitempty"`
+	Node   string `json:"node,omitempty"`
 }
 
 // demoPage is served at /demo. It is embedded rather than read from disk so
@@ -74,6 +82,16 @@ type streamStats struct {
 //
 //go:embed demo.html
 var demoPage []byte
+
+// ttftMillis converts the engine's seconds-based time-to-first-token, which is
+// -1 when no text was produced, into milliseconds — or 0, so `omitempty` drops
+// it from the JSON rather than reporting a meaningless zero.
+func ttftMillis(seconds float64) int64 {
+	if seconds < 0 {
+		return 0
+	}
+	return int64(seconds * 1000)
+}
 
 // identity is where this instance is running. In Kubernetes both come from the
 // Downward API; elsewhere the pod falls back to the hostname and the node is
@@ -229,6 +247,7 @@ func (s *server) handleHealth(w http.ResponseWriter, r *http.Request) {
 		"workers":             workers,
 		"model_context_limit": contextLimit,
 		"session_context":     s.sessionContext,
+		"max_tokens_limit":    s.maxTokensLimit,
 		"omp_threads":         threads,
 	})
 }
@@ -296,7 +315,22 @@ func (s *server) handleGenerate(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if req.MaxTokens < 1 || req.MaxTokens > s.maxTokensLimit {
-		writeError(w, http.StatusBadRequest, "invalid max token limit")
+		writeError(w, http.StatusBadRequest, fmt.Sprintf(
+			"max_tokens must be between 1 and %d", s.maxTokensLimit))
+		return
+	}
+
+	// The prompt needs at least one token, so max_tokens can never equal the
+	// session context. Catching it here makes it a 400 with a useful message
+	// instead of the engine's generic failure surfacing as a 500.
+	//
+	// This does not catch every case: the real limit is prompt tokens plus
+	// max_tokens, and counting prompt tokens would mean exposing the tokenizer
+	// through the C ABI. An over-long prompt is still a 500 for now.
+	if s.sessionContext > 0 && req.MaxTokens >= s.sessionContext {
+		writeError(w, http.StatusBadRequest, fmt.Sprintf(
+			"max_tokens (%d) must leave room in the %d-token session context; "+
+				"the prompt needs space too", req.MaxTokens, s.sessionContext))
 		return
 	}
 
@@ -331,6 +365,7 @@ func (s *server) handleGenerate(w http.ResponseWriter, r *http.Request) {
 		GeneratedTokens: stats.GeneratedTokens,
 		Truncated:       stats.StoppedEarly,
 		MS:              elapsed.Milliseconds(),
+		TTFTMs:          ttftMillis(stats.FirstTokenSeconds),
 		Pod:             s.id.Pod,
 		Node:            s.id.Node,
 	}
@@ -445,6 +480,7 @@ func (s *server) streamGenerate(w http.ResponseWriter, r *http.Request,
 		GeneratedTokens: stats.GeneratedTokens,
 		Truncated:       stats.StoppedEarly,
 		MS:              time.Since(start).Milliseconds(),
+		TTFTMs:          ttftMillis(stats.FirstTokenSeconds),
 		Pod:             s.id.Pod,
 		Node:            s.id.Node,
 	})
@@ -482,7 +518,8 @@ func run() error {
 		addr           = flag.String("addr", envStr("ADDR", ":8080"), "listen address (env: ADDR)")
 		sessionContext = flag.Int("context", envInt("CONTEXT", 1024),
 			"session context ceiling in tokens, ~27.6 KB each (env: CONTEXT)")
-		maxTokensLimit = flag.Int("max-tokens-limit", 512, "largest max_tokens a request may request")
+		maxTokensLimit = flag.Int("max-tokens-limit", envInt("MAX_TOKENS_LIMIT", 512),
+			"largest max_tokens a request may request (env: MAX_TOKENS_LIMIT)")
 		ompThreadsFlag = flag.Int("threads", envInt("THREADS", 0),
 			"OpenMP threads per request (0 = derive from cores/workers) (env: THREADS)")
 		workers = flag.Int("workers", envInt("WORKERS", 1),
@@ -588,7 +625,8 @@ func run() error {
 	}
 
 	srv.ready(pool, pool.Workers(), model.ContextLimit(), ompThreads)
-	log.Printf("ready: %d worker(s), queue wait %s", pool.Workers(), *queueWait)
+	log.Printf("ready: %d worker(s), queue wait %s, context %d tokens, max_tokens<=%d",
+		pool.Workers(), *queueWait, *sessionContext, *maxTokensLimit)
 
 	// Wait for a signal, or for the listener to fail.
 	var serveErr error

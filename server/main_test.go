@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -334,6 +335,33 @@ func TestIdentityStringFallsBack(t *testing.T) {
 	} {
 		if got := (identity{Pod: tc.pod, Node: tc.node}).String(); got != tc.want {
 			t.Errorf("identity{%q,%q}.String() = %q, want %q", tc.pod, tc.node, got, tc.want)
+		}
+	}
+}
+
+// A request that cannot possibly fit the session context is the caller's
+// fault, so it must be a 400 with a useful message rather than the engine's
+// failure surfacing as a 500.
+func TestGenerateRejectsMaxTokensBeyondContext(t *testing.T) {
+	fake := &fakeGenerator{pieces: []string{"x"}}
+	srv := newTestServer(fake)
+	srv.sessionContext = 512
+
+	for _, maxTokens := range []int{512, 511} {
+		body := fmt.Sprintf(`{"prompt":"hi","max_tokens":%d}`, maxTokens)
+		rec := do(t, srv, http.MethodPost, body)
+		switch maxTokens {
+		case 512: // equals the context, leaving no room for the prompt
+			if rec.Code != http.StatusBadRequest {
+				t.Errorf("max_tokens=%d: status = %d, want 400", maxTokens, rec.Code)
+			}
+			if fake.gotPrompt != "" {
+				t.Error("the engine should not be called for an impossible request")
+			}
+		case 511: // leaves one token; the engine decides
+			if rec.Code != http.StatusOK {
+				t.Errorf("max_tokens=%d: status = %d, want 200", maxTokens, rec.Code)
+			}
 		}
 	}
 }

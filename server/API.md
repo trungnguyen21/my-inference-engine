@@ -47,7 +47,8 @@ so accepting the field would advertise behaviour the engine does not have.
 | `prompt_tokens`    | tokens after the instruction template is applied |
 | `generated_tokens` | sampled tokens; **counts a terminating EOS that is not in `text`**, so this can exceed the visible token count by one |
 | `truncated`        | true when generation stopped early (client disconnected) |
-| `ms`               | generation wall time in milliseconds, excluding model load |
+| `ms`               | total wall time in milliseconds, excluding model load |
+| `ttft_ms`          | time to first token: tokenization + prefill + the first sampled token. Omitted when no text was produced. With a long prompt this is most of `ms` — prefill is sequential, so a 93-token prompt measured 6,026 ms of an 8,477 ms request |
 
 ### Errors
 
@@ -59,10 +60,15 @@ All errors use the same body:
 
 | Status | When |
 |--------|------|
-| `400`  | malformed JSON, missing/empty `prompt`, `prompt` too long, `max_tokens` out of range, prompt + `max_tokens` exceeds the session's context |
+| `400`  | malformed JSON, missing/empty `prompt`, `prompt` too long, `max_tokens` out of range, or `max_tokens` large enough that no prompt could fit the session context |
 | `405`  | any method other than POST |
 | `500`  | the engine failed |
 | `503`  | the server is busy (**Phase 3**; a single-session server may skip this) |
+
+A long prompt that overflows the context is **still a 500**, because counting
+prompt tokens up front would mean exposing the tokenizer through the C ABI. The
+cheap half is covered: `max_tokens >= session_context` can never succeed and is
+rejected as a 400 before the engine is called.
 
 Distinguishing 400 from 500 matters: a caller can fix a 400 by changing the
 request, and can only retry a 500. The engine returns both kinds as a plain Go
@@ -154,10 +160,16 @@ Returns `200` once the model is loaded:
 {
   "status": "ok",
   "model_context_limit": 32768,
-  "session_context": 1024,
-  "omp_threads": 4
+  "session_context": 2048,
+  "max_tokens_limit": 512,
+  "omp_threads": 4,
+  "pod": "8a988d8e5b9c",
+  "node": "compose-host"
 }
 ```
+
+`max_tokens_limit` and `session_context` are what the demo page uses to bound
+its own input, so an impossible request cannot be built from the UI.
 
 `omp_threads` is how many threads **one** request may use inside the C++
 kernels. It is reported because OpenMP is invisible from Go otherwise, and it

@@ -34,10 +34,11 @@ services:
       replicas: 2
       resources:
         limits:
-          # Headroom over the ~27 MiB of KV cache at CONTEXT=512 plus the Go
-          # runtime. The model itself is mmap'd from the shared mount, so it is
-          # counted once by the kernel rather than once per replica.
-          memory: 900M
+          # ~113 MiB of KV cache at CONTEXT=4096, plus the Go runtime, plus the
+          # mmap'd model. The model pages are shared between replicas by the
+          # kernel, but cgroup accounting charges them to whichever container
+          # faults them in first — so the limit must accommodate one full copy.
+          memory: 1200M
 
     volumes:
       # Read-only, and shared by every replica: because the engine mmaps the
@@ -48,7 +49,7 @@ services:
     environment:
       MODEL: /models/qwen-2.5.gguf
       WORKERS: "1"
-      CONTEXT: "512"
+      CONTEXT: "2048"
       # 2 replicas x 1 worker x 4 threads = 8 threads on 8 cores. Leaving this
       # unset means "all cores" per replica, which is a severe cliff: measured
       # at 7 s becoming 120 s under oversubscription.

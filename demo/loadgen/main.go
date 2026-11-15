@@ -291,9 +291,9 @@ func orDash(s string) string {
 }
 
 var prompts = []string{
-	"What is the capital of France?",
-	"What is 2+2?",
-	"Name three primary colors.",
+	"Generate tests that measure response time differences between cached and uncached requests for GET /api/content/:id. Clear the cache, measure cold response time, then measure warm response time. Assert that cache hit responses are at least 5x faster than cache misses. Report cache hit ratio over 1000 requests.",
+	"Write a performance test that simulates API requests from five geographic regions (US-East, US-West, EU-West, Asia-Pacific, South America). Compare response times across regions for the /api/search endpoint. Flag any region where latency exceeds 2x the lowest-region baseline. Output a latency risk heatmap by region.",
+	"Write a stress test that ramps from 50 to 2000 concurrent users in 60 seconds on POST /api/orders. Monitor throughput, error rates, and response times during the spike. Include assertions that verify the system degrades gracefully rather than returning 500 errors. Report the exact concurrency level where error rate exceeds 5%.",
 	"What color is the sky?",
 	"Who wrote Hamlet?",
 }
