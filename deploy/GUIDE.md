@@ -69,26 +69,39 @@ takes down the old pods — a pod that fails its readiness probe just blocks the
 rollout. Diagnose with `kubectl describe pod <name>` (look at Events) and roll
 back with `kubectl rollout undo deployment/engine`.
 
-## Layer 3: AWS — k3s on Graviton EC2
+## Layer 3: AWS
 
-Two independent halves. Know which one your change touches.
+Two separate Terraform root modules with separate state files — know which
+one your change touches:
 
-### Infrastructure (`infra/`, Terraform)
+- **`infra/`** — self-managed k3s: plain Graviton EC2 nodes, security groups,
+  and a bootstrap script that installs Docker and downloads the model to
+  `/opt/models`. You own the control plane (it runs on one of the nodes).
+- **`infra/eks/`** — managed EKS: AWS runs the control plane, the nodes are
+  an ASG-backed managed node group of pure workers, and the module also owns
+  the ECR repository and the IAM roles (cluster role; node role with
+  WorkerNode + CNI + ECR-read policies).
 
-Owns: EC2 nodes, security groups, SSH keys, and the bootstrap script that
-installs Docker and downloads the model to `/opt/models` on each node.
+### Infrastructure changes (Terraform)
 
 ```sh
-cd infra
-terraform plan        # always read the plan first
+cd infra          # or infra/eks — they are independent
+terraform plan    # always read the plan first
 terraform apply
-terraform output      # node_ips, ssh command
+terraform output  # infra/: node_ips, ssh. infra/eks/: kubeconfig_command,
+                  # ecr_repository_url, image_push_commands
 ```
 
-Editing `bootstrap.sh.tftpl` **replaces the machines**
-(`user_data_replace_on_change = true`) — that is deliberate, so nodes never
-drift from their script, but it means the k3s cluster on them is rebuilt too.
-Plan for that, don't be surprised by it.
+Module-specific notes:
+
+- `infra/`: editing `bootstrap.sh.tftpl` **replaces the machines**
+  (`user_data_replace_on_change = true`) — deliberate, so nodes never drift
+  from their script, but the k3s cluster on them is rebuilt too.
+- `infra/eks/`: `terraform destroy` removes the ECR repo *including pushed
+  images* (`force_delete = true`). The node group pins
+  `min = desired = node_count` with one node of headroom for a live scale-up
+  demo. After `apply`, run the `kubeconfig_command` output
+  (`aws eks update-kubeconfig ...`) to point kubectl at the cluster.
 
 ### Workload (`deploy/k8s/eks/`, kubectl)
 
