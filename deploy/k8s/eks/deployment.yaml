@@ -54,8 +54,14 @@ spec:
 
       containers:
         - name: engine
-          image: 327319899002.dkr.ecr.ca-central-1.amazonaws.com/inference-engine:9f0f109-dirty-230945
+          image: 327319899002.dkr.ecr.ca-central-1.amazonaws.com/inference-engine:ee72f61-dirty-234221
           imagePullPolicy: IfNotPresent
+
+          # Flags append to the image ENTRYPOINT. queue-wait drops from its
+          # 30 s default so a busy pod answers 503 in half a second — the
+          # dashboard then retries onto an idle pod (a new connection re-rolls
+          # the Service's random routing) instead of queueing invisibly.
+          args: ["-queue-wait=500ms"]
 
           ports:
             - containerPort: 8080

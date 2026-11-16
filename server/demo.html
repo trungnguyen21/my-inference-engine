@@ -99,18 +99,67 @@ function makePane(i) {
   return el;
 }
 
-// EventSource is GET-only and this endpoint is a POST, so the SSE framing is
-// parsed by hand off a fetch body stream. Events are separated by a blank line.
+// A pane's request is retried, with two distinct triggers:
+//
+//   busy   — the pod answered 503 (queue-wait expired). A retry opens a new
+//            connection, which re-rolls the Service's random pod choice; with
+//            any pod idle, a few rolls find it. This is how four panes end up
+//            on four distinct pods without anyone coordinating them.
+//   broken — the stream died without [DONE] (pod killed, node gone). The
+//            generation restarts from scratch on whichever pod answers next;
+//            there is no resume, same as real LLM APIs.
+//
+// Anything else (400s, aborts) is final — retrying a malformed request would
+// just fail identically forever.
+const MAX_ATTEMPTS = 5;
+
 async function runPane(i, maxTokens, signal) {
   const dot = document.getElementById(`dot${i}`);
   const who = document.getElementById(`who${i}`);
   const out = document.getElementById(`out${i}`);
   const meta = document.getElementById(`meta${i}`);
+  const els = { dot, who, out, meta };
+
+  // Every attempt's pod and fate, rendered into the meta line so the routing
+  // history stays visible: "pod-a ✗busy → pod-b ✓".
+  const history = [];
+
+  for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
+    const result = await streamOnce(i, maxTokens, signal, els, history, attempt);
+    if (result === "done" || result === "fatal" || signal.aborted) return;
+
+    if (attempt === MAX_ATTEMPTS) break; // out of attempts; fall through to give up
+
+    // busy/broken: back off briefly before the re-roll. Linear + jitter —
+    // enough to let a draining pod leave the endpoint list, short enough
+    // that a retry is visibly "immediate" on screen.
+    const delay = 300 * attempt + Math.random() * 300;
+    dot.className = "dot wait";
+    who.textContent = `pane ${i + 1} — ${result}, retry ${attempt + 1}/${MAX_ATTEMPTS} in ${Math.round(delay)} ms`;
+    await new Promise(r => setTimeout(r, delay));
+    if (signal.aborted) return;
+  }
+
+  dot.className = "dot err";
+  who.textContent = `pane ${i + 1} — gave up`;
+  meta.className = "meta bad";
+  meta.textContent = `gave up after ${MAX_ATTEMPTS} attempts (${historyText(history)}) — capacity full or service down`;
+}
+
+function historyText(history) {
+  return history.map(h => `${h.pod} ${h.ok ? "✓" : "✗" + h.why}`).join(" → ");
+}
+
+// EventSource is GET-only and this endpoint is a POST, so the SSE framing is
+// parsed by hand off a fetch body stream. Events are separated by a blank line.
+// Returns "done" | "busy" | "broken" | "fatal".
+async function streamOnce(i, maxTokens, signal, els, history, attempt) {
+  const { dot, who, out, meta } = els;
   out.textContent = "";
-  meta.textContent = "";
   meta.className = "meta";
+  meta.textContent = attempt > 1 ? historyText(history) : "";
   dot.className = "dot wait";
-  who.textContent = `pane ${i + 1} — connecting`;
+  who.textContent = `pane ${i + 1} — connecting (attempt ${attempt})`;
 
   const startedAt = performance.now();
   let resp;
@@ -126,25 +175,30 @@ async function runPane(i, maxTokens, signal) {
       signal,
     });
   } catch (e) {
-    if (signal.aborted) { dot.className = "dot"; who.textContent = `pane ${i+1} — stopped`; return; }
-    dot.className = "dot err";
-    meta.className = "meta bad";
-    meta.textContent = String(e);
-    return;
+    if (signal.aborted) { dot.className = "dot"; who.textContent = `pane ${i+1} — stopped`; return "fatal"; }
+    // The fetch itself failed — connection refused/reset, e.g. the NodePort
+    // entry briefly unreachable. Retryable.
+    history.push({ pod: "no-connection", ok: false, why: "net" });
+    return "broken";
   }
 
   // The header is set on every response, errors included, so a pane can show
   // which pod refused it and not just which one served it.
   const served = resp.headers.get("X-Served-By") || "unknown";
   const [pod, node] = served.includes("/") ? served.split("/") : [served, ""];
-  who.innerHTML = node ? `<b>${node}</b> &middot; ${pod}` : `<b>${pod}</b>`;
+  who.innerHTML = (node ? `<b>${node}</b> &middot; ${pod}` : `<b>${pod}</b>`) +
+                  (attempt > 1 ? ` &middot; attempt ${attempt}` : "");
 
+  if (resp.status === 503) {
+    history.push({ pod, ok: false, why: "busy" });
+    return "busy";
+  }
   if (!resp.ok) {
     const body = await resp.text().catch(() => "");
     dot.className = "dot err";
     meta.className = "meta bad";
     meta.textContent = `HTTP ${resp.status} — ${body.slice(0, 120)}`;
-    return;
+    return "fatal";
   }
 
   dot.className = "dot live";
@@ -231,16 +285,23 @@ async function runPane(i, maxTokens, signal) {
     }
   }
 
-  // The absence of [DONE] is how truncation is detected: the server only sends
-  // it on success, so a stream that stops without it was cut short.
+  // The absence of [DONE] is how a cut stream is detected: the server only
+  // sends it on success, so a stream that stops without it died mid-flight —
+  // the retryable case this whole loop exists for.
   if (!sawDone && !signal.aborted) {
-    meta.className = "meta bad";
-    meta.textContent += meta.textContent ? "  ·  stream ended without [DONE]"
-                                         : "stream ended without [DONE]";
-    dot.className = "dot err";
-  } else {
-    dot.className = "dot";
+    history.push({ pod, ok: false, why: "cut" });
+    return "broken";
   }
+
+  dot.className = "dot";
+  history.push({ pod, ok: true });
+  // Keep the routing story on screen next to the stats when it took more
+  // than one attempt to get here.
+  if (history.length > 1) {
+    meta.innerHTML = `${historyText(history)}` +
+                     (meta.innerHTML ? ` &middot; ${meta.innerHTML}` : "");
+  }
+  return "done";
 }
 
 function stopAll() {
