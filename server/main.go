@@ -7,6 +7,7 @@ package main
 
 import (
 	"context"
+	_ "embed"
 	"encoding/json"
 	"errors"
 	"flag"
@@ -42,6 +43,12 @@ type generateResponse struct {
 	GeneratedTokens int    `json:"generated_tokens"`
 	Truncated       bool   `json:"truncated"`
 	MS              int64  `json:"ms"`
+	// TTFTMs is measured by the engine from prompt processing through the first
+	// emitted piece, so it includes tokenization and prefill but not model
+	// load. Omitted when the request produced no text.
+	TTFTMs int64  `json:"ttft_ms,omitempty"`
+	Pod    string `json:"pod,omitempty"`
+	Node   string `json:"node,omitempty"`
 }
 
 type errorResponse struct {
@@ -58,6 +65,65 @@ type streamStats struct {
 	GeneratedTokens int   `json:"generated_tokens"`
 	Truncated       bool  `json:"truncated"`
 	MS              int64 `json:"ms"`
+	// TTFTMs is measured by the engine from prompt processing through the first
+	// emitted piece, so it includes tokenization and prefill but not model
+	// load. Omitted when the request produced no text.
+	TTFTMs int64  `json:"ttft_ms,omitempty"`
+	Pod    string `json:"pod,omitempty"`
+	Node   string `json:"node,omitempty"`
+}
+
+// demoPage is served at /demo. It is embedded rather than read from disk so
+// the binary stays self-contained — no volume mount, and it works unchanged
+// inside a container and behind a NodePort.
+//
+// Serving it from the server also sidesteps CORS: the page and the API share
+// an origin, so a POST from the page needs no cross-origin headers.
+//
+//go:embed demo.html
+var demoPage []byte
+
+// ttftMillis converts the engine's seconds-based time-to-first-token, which is
+// -1 when no text was produced, into milliseconds — or 0, so `omitempty` drops
+// it from the JSON rather than reporting a meaningless zero.
+func ttftMillis(seconds float64) int64 {
+	if seconds < 0 {
+		return 0
+	}
+	return int64(seconds * 1000)
+}
+
+// identity is where this instance is running. In Kubernetes both come from the
+// Downward API; elsewhere the pod falls back to the hostname and the node is
+// empty.
+//
+// The NODE name is the point: four concurrent streams look identical whether
+// they are served by one machine or two unless the response says which.
+type identity struct {
+	Pod  string
+	Node string
+}
+
+func detectIdentity() identity {
+	pod := envStr("POD_NAME", "")
+	if pod == "" {
+		if host, err := os.Hostname(); err == nil {
+			pod = host
+		}
+	}
+	return identity{Pod: pod, Node: envStr("NODE_NAME", "")}
+}
+
+// String is what goes in the X-Served-By header.
+func (i identity) String() string {
+	switch {
+	case i.Pod == "" && i.Node == "":
+		return "unknown"
+	case i.Node == "":
+		return i.Pod
+	default:
+		return i.Pod + "/" + i.Node
+	}
 }
 
 // ---------------------------------------------------------------------------
@@ -96,9 +162,10 @@ type server struct {
 	maxThreads   int // OpenMP threads per request; see engine.MaxThreads
 
 	// Static configuration, set before serving.
-	maxTokensLimit int // largest max_tokens a request may ask for
-	promptCapacity int // largest prompt in bytes; from engine.PromptCapacity()
-	sessionContext int // the session's context ceiling, for pre-flight checks
+	id             identity // which pod and node this is; see detectIdentity
+	maxTokensLimit int      // largest max_tokens a request may ask for
+	promptCapacity int      // largest prompt in bytes; from engine.PromptCapacity()
+	sessionContext int      // the session's context ceiling, for pre-flight checks
 }
 
 // ready publishes the loaded engine. Requests are refused until it is called.
@@ -148,6 +215,11 @@ func (s *server) writeGenerateError(w http.ResponseWriter, err error) {
 		// instead of leaving it to guess.
 		workers, _, _, _ := s.snapshot()
 		w.Header().Set("Retry-After", "1")
+		// Hang up after rejecting. Browsers pool keep-alive connections, and
+		// Kubernetes Services route per CONNECTION — so a retry on a reused
+		// connection lands on this same busy pod forever. Closing forces the
+		// client's retry onto a fresh connection, which re-rolls the pod.
+		w.Header().Set("Connection", "close")
 		writeError(w, http.StatusServiceUnavailable,
 			fmt.Sprintf("all %d workers busy; retry shortly", workers))
 	case errors.Is(err, context.Canceled), errors.Is(err, context.DeadlineExceeded):
@@ -175,9 +247,12 @@ func (s *server) handleHealth(w http.ResponseWriter, r *http.Request) {
 	}
 	writeJSON(w, code, map[string]any{
 		"status":              status,
+		"pod":                 s.id.Pod,
+		"node":                s.id.Node,
 		"workers":             workers,
 		"model_context_limit": contextLimit,
 		"session_context":     s.sessionContext,
+		"max_tokens_limit":    s.maxTokensLimit,
 		"omp_threads":         threads,
 	})
 }
@@ -185,6 +260,15 @@ func (s *server) handleHealth(w http.ResponseWriter, r *http.Request) {
 // handleLive answers "is the process alive". It must not depend on the model:
 // a liveness probe that fails during the ~4 s load would make Kubernetes kill
 // the container before it ever finished starting.
+func (s *server) handleDemo(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		writeError(w, http.StatusMethodNotAllowed, "use GET")
+		return
+	}
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	w.Write(demoPage)
+}
+
 func (s *server) handleLive(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet {
 		writeError(w, http.StatusMethodNotAllowed, "use GET")
@@ -209,6 +293,10 @@ func (s *server) handleReady(w http.ResponseWriter, r *http.Request) {
 
 // handleGenerate implements POST /generate as specified in API.md.
 func (s *server) handleGenerate(w http.ResponseWriter, r *http.Request) {
+	// Set before any write: this must also be present on 4xx/5xx, so a demo
+	// can show which pod refused a request, not just which one served it.
+	w.Header().Set("X-Served-By", s.id.String())
+
 	if r.Method != http.MethodPost {
 		writeError(w, http.StatusMethodNotAllowed, "use POST")
 		return
@@ -232,7 +320,22 @@ func (s *server) handleGenerate(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if req.MaxTokens < 1 || req.MaxTokens > s.maxTokensLimit {
-		writeError(w, http.StatusBadRequest, "invalid max token limit")
+		writeError(w, http.StatusBadRequest, fmt.Sprintf(
+			"max_tokens must be between 1 and %d", s.maxTokensLimit))
+		return
+	}
+
+	// The prompt needs at least one token, so max_tokens can never equal the
+	// session context. Catching it here makes it a 400 with a useful message
+	// instead of the engine's generic failure surfacing as a 500.
+	//
+	// This does not catch every case: the real limit is prompt tokens plus
+	// max_tokens, and counting prompt tokens would mean exposing the tokenizer
+	// through the C ABI. An over-long prompt is still a 500 for now.
+	if s.sessionContext > 0 && req.MaxTokens >= s.sessionContext {
+		writeError(w, http.StatusBadRequest, fmt.Sprintf(
+			"max_tokens (%d) must leave room in the %d-token session context; "+
+				"the prompt needs space too", req.MaxTokens, s.sessionContext))
 		return
 	}
 
@@ -267,6 +370,9 @@ func (s *server) handleGenerate(w http.ResponseWriter, r *http.Request) {
 		GeneratedTokens: stats.GeneratedTokens,
 		Truncated:       stats.StoppedEarly,
 		MS:              elapsed.Milliseconds(),
+		TTFTMs:          ttftMillis(stats.FirstTokenSeconds),
+		Pod:             s.id.Pod,
+		Node:            s.id.Node,
 	}
 
 	writeJSON(w, http.StatusOK, response)
@@ -379,6 +485,9 @@ func (s *server) streamGenerate(w http.ResponseWriter, r *http.Request,
 		GeneratedTokens: stats.GeneratedTokens,
 		Truncated:       stats.StoppedEarly,
 		MS:              time.Since(start).Milliseconds(),
+		TTFTMs:          ttftMillis(stats.FirstTokenSeconds),
+		Pod:             s.id.Pod,
+		Node:            s.id.Node,
 	})
 	if err != nil {
 		log.Printf("stream: marshal stats: %v", err)
@@ -400,13 +509,22 @@ func (s *server) streamGenerate(w http.ResponseWriter, r *http.Request,
 // ---------------------------------------------------------------------------
 
 func main() {
+	// A thin wrapper over run so that deferred cleanup still happens on the
+	// error path: log.Fatal calls os.Exit, which skips defers.
+	if err := run(); err != nil {
+		log.Fatalf("fatal: %v", err)
+	}
+}
+
+func run() error {
 	var (
 		modelPath = flag.String("model", envStr("MODEL", "../models/qwen-2.5.gguf"),
 			"path to the GGUF model (env: MODEL)")
 		addr           = flag.String("addr", envStr("ADDR", ":8080"), "listen address (env: ADDR)")
 		sessionContext = flag.Int("context", envInt("CONTEXT", 1024),
 			"session context ceiling in tokens, ~27.6 KB each (env: CONTEXT)")
-		maxTokensLimit = flag.Int("max-tokens-limit", 512, "largest max_tokens a request may request")
+		maxTokensLimit = flag.Int("max-tokens-limit", envInt("MAX_TOKENS_LIMIT", 512),
+			"largest max_tokens a request may request (env: MAX_TOKENS_LIMIT)")
 		ompThreadsFlag = flag.Int("threads", envInt("THREADS", 0),
 			"OpenMP threads per request (0 = derive from cores/workers) (env: THREADS)")
 		workers = flag.Int("workers", envInt("WORKERS", 1),
@@ -417,6 +535,7 @@ func main() {
 	flag.Parse()
 
 	srv := &server{
+		id:             detectIdentity(),
 		maxTokensLimit: *maxTokensLimit,
 		promptCapacity: engine.PromptCapacity(),
 		sessionContext: *sessionContext,
@@ -427,6 +546,7 @@ func main() {
 	mux.HandleFunc("/health/live", srv.handleLive)
 	mux.HandleFunc("/health/ready", srv.handleReady)
 	mux.HandleFunc("/generate", srv.handleGenerate)
+	mux.HandleFunc("/demo", srv.handleDemo)
 
 	httpServer := &http.Server{
 		Addr:    *addr,
@@ -457,11 +577,12 @@ func main() {
 		os.Interrupt, syscall.SIGTERM)
 	defer stopSignals()
 
+	log.Printf("identity: %s", srv.id)
 	log.Printf("loading %s ...", *modelPath)
 	loadStart := time.Now()
 	model, err := engine.Open(*modelPath)
 	if err != nil {
-		log.Fatalf("load model: %v", err)
+		return fmt.Errorf("load model: %w", err)
 	}
 	defer model.Close()
 	log.Printf("loaded in %s. model context limit = %d tokens",
@@ -505,20 +626,22 @@ func main() {
 
 	pool, err := newSessionPool(model, *workers, *sessionContext, *queueWait)
 	if err != nil {
-		log.Fatalf("create session pool: %v", err)
+		return fmt.Errorf("create session pool: %w", err)
 	}
 
 	srv.ready(pool, pool.Workers(), model.ContextLimit(), ompThreads)
-	log.Printf("ready: %d worker(s), queue wait %s", pool.Workers(), *queueWait)
+	log.Printf("ready: %d worker(s), queue wait %s, context %d tokens, max_tokens<=%d",
+		pool.Workers(), *queueWait, *sessionContext, *maxTokensLimit)
 
 	// Wait for a signal, or for the listener to fail.
+	var serveErr error
 	select {
 	case <-shutdownCtx.Done():
 		log.Printf("shutdown signal received; draining")
-	case err := <-listening:
-		if err != nil {
-			log.Printf("serve: %v", err)
-		}
+	case serveErr = <-listening:
+		// A failed listener must not look like a clean exit, or systemd's
+		// Restart=on-failure never fires and Kubernetes reads the container as
+		// having completed successfully.
 	}
 
 	// Stop accepting, let in-flight requests finish, then release the engine.
@@ -531,6 +654,11 @@ func main() {
 	}
 	pool.Close()
 	log.Printf("stopped")
+
+	if serveErr != nil {
+		return fmt.Errorf("serve: %w", serveErr)
+	}
+	return nil
 }
 
 // envStr reads a string environment variable, falling back to def.

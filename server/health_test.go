@@ -65,7 +65,7 @@ func TestReadinessFlipsOnceLoaded(t *testing.T) {
 
 // A request arriving during startup must be refused, not crash on a nil engine.
 func TestGenerateIsRefusedWhileLoading(t *testing.T) {
-	srv := &server{promptCapacity: 4096, maxTokensLimit: 512}
+	srv := &server{promptCapacity: 4096, maxTokensLimit: 512, sessionContext: 1024}
 	rec := do(t, srv, http.MethodPost, `{"prompt":"hi","max_tokens":8}`)
 
 	if rec.Code != http.StatusServiceUnavailable {

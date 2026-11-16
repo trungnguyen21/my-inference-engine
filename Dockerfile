@@ -8,6 +8,8 @@
 # debian-slim rather than scratch: it needs libc, libstdc++, libgomp, and the
 # engine's own shared libraries.
 # ---------------------------------------------------------------------------
+# No -slim here: golang images have no slim variant, and this is a discarded
+# build stage anyway — only the runtime stage's size reaches production.
 FROM golang:1.26-bookworm AS build
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
@@ -23,7 +25,23 @@ COPY CMakeLists.txt ./
 COPY include/ include/
 COPY src/ src/
 COPY tests/ tests/
-RUN cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DENGINE_OPENMP=ON \
+# GGML_NATIVE=OFF for two reasons.
+#
+# Correctness: ggml probes the build host's CPU, and on arm64 with GCC that
+# produced a -march string enabling fp16 vector arithmetic without enabling
+# fp16 itself, so always_inline NEON intrinsics failed to compile.
+#
+# Portability: this image is built in a Linux VM on an Apple M2 and runs on
+# Graviton. Baking host-detected CPU features into it risks illegal
+# instructions on a target that lacks them.
+#
+# It costs nothing here: llama.cpp is used only for its tokenizer, so the
+# performance of its CPU backend is irrelevant. This project's own kernels are
+# unaffected — they rely on baseline NEON, which every armv8 target has.
+RUN cmake -S . -B build \
+        -DCMAKE_BUILD_TYPE=Release \
+        -DENGINE_OPENMP=ON \
+        -DGGML_NATIVE=OFF \
     && cmake --build build --target engine -j"$(nproc)"
 
 # Now the Go server. Module files first so dependency resolution caches.
@@ -40,7 +58,7 @@ RUN CGO_ENABLED=1 go build -trimpath -o /out/server .
 # ---------------------------------------------------------------------------
 # Stage 2: runtime.
 # ---------------------------------------------------------------------------
-FROM debian:bookworm-slim AS runtime
+FROM debian:trixie-slim AS runtime
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
         libgomp1 libstdc++6 ca-certificates curl \

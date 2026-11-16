@@ -1,0 +1,86 @@
+# Two replicas on one host. A deliberate stepping stone before Kubernetes: it
+# validates the image, the volume mount, the environment config, and that two
+# distinct pods show up in the demo kit — without a cluster.
+#
+#   docker compose up --build
+#   open http://localhost:8080/demo
+#   cd demo && go run ./loadgen -url http://localhost:8080 -users 4
+#
+# What Compose cannot do, which is the argument for Phase 7:
+#
+#   * No readiness gating. Compose's DNS returns every replica's address
+#     regardless of healthcheck state, so a container still inside its ~4 s
+#     model load already receives traffic. The /health/live vs /health/ready
+#     split is inert here — Kubernetes is what makes it mean something.
+#   * No rolling updates. No maxSurge/maxUnavailable, no waiting for a new
+#     container to be ready before stopping the old one, no rollback.
+#   * No reconciliation loop. This file is applied once; `restart` covers
+#     crashes but not the general case.
+#   * One machine, by definition.
+
+services:
+  engine:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: inference-engine:dev
+
+    # Scaled replicas cannot each publish the same host port, so traffic goes
+    # through the gateway below rather than being published directly.
+    expose:
+      - "8080"
+
+    deploy:
+      replicas: 2
+      resources:
+        limits:
+          # ~113 MiB of KV cache at CONTEXT=4096, plus the Go runtime, plus the
+          # mmap'd model. The model pages are shared between replicas by the
+          # kernel, but cgroup accounting charges them to whichever container
+          # faults them in first — so the limit must accommodate one full copy.
+          memory: 1200M
+
+    volumes:
+      # Read-only, and shared by every replica: because the engine mmaps the
+      # weights PROT_READ/MAP_PRIVATE, all replicas share one set of physical
+      # pages through the page cache instead of each holding 469 MiB.
+      - ./models:/models:ro
+
+    environment:
+      MODEL: /models/qwen-2.5.gguf
+      WORKERS: "1"
+      CONTEXT: "2048"
+      # 2 replicas x 1 worker x 4 threads = 8 threads on 8 cores. Leaving this
+      # unset means "all cores" per replica, which is a severe cliff: measured
+      # at 7 s becoming 120 s under oversubscription.
+      THREADS: "4"
+      # Compose has no Downward API. Setting NODE_NAME by hand keeps the demo
+      # kit's output shaped the same as it will be in Kubernetes; POD_NAME
+      # falls back to the container hostname, which is already unique.
+      NODE_NAME: compose-host
+
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://localhost:8080/health/ready"]
+      interval: 10s
+      timeout: 3s
+      retries: 3
+      # Must exceed the model load, or the container is marked unhealthy while
+      # it is still legitimately starting.
+      start_period: 60s
+
+    restart: unless-stopped
+    # Matches the server's 60 s drain, so in-flight generations finish instead
+    # of being killed mid-stream.
+    stop_grace_period: 65s
+
+  # A one-line load balancer, because Compose cannot publish one host port
+  # across scaled replicas. nginx resolves `engine` to every replica address.
+  gateway:
+    image: nginx:1.27-alpine
+    depends_on:
+      - engine
+    ports:
+      - "8080:8080"
+    volumes:
+      - ./deploy/nginx.conf:/etc/nginx/conf.d/default.conf:ro
+    restart: unless-stopped

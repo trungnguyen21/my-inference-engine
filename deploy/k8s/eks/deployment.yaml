@@ -1,0 +1,124 @@
+# EKS variant of ../deployment.yaml. Same object, four deliberate differences:
+#
+#   1. image: pulled from ECR (nodes authenticate via their IAM role), not
+#      sideloaded with `k3d image import`.
+#   2. an initContainer gates startup on the model file, because the
+#      model-download DaemonSet races the scheduler on a fresh node.
+#   3. hostPath is Directory (strict) — creating it is the DaemonSet's job.
+#
+# Everything not commented here is explained in ../deployment.yaml.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: engine
+spec:
+  replicas: 4
+  selector:
+    matchLabels:
+      app: engine
+  strategy:
+    rollingUpdate:
+      maxSurge: 1
+      maxUnavailable: 0
+  template:
+    metadata:
+      labels:
+        app: engine
+    spec:
+      topologySpreadConstraints:
+        - maxSkew: 1
+          topologyKey: kubernetes.io/hostname
+          whenUnsatisfiable: DoNotSchedule
+          labelSelector:
+            matchLabels:
+              app: engine
+
+      # Runs to completion before the engine container is allowed to start.
+      # Waits (rather than downloads) so 4 replicas cannot fetch the model 4
+      # times; the DaemonSet stays the single writer, this is just a latch.
+      initContainers:
+        - name: wait-for-model
+          image: busybox:1.37
+          command:
+            - sh
+            - -c
+            - |
+              until [ "$(wc -c < /models/qwen-2.5.gguf 2>/dev/null || echo 0)" = "491400032" ]; do
+                echo "waiting for model download..."
+                sleep 5
+              done
+          volumeMounts:
+            - name: models
+              mountPath: /models
+              readOnly: true
+
+      containers:
+        - name: engine
+          image: 327319899002.dkr.ecr.ca-central-1.amazonaws.com/inference-engine:1dd1c9f
+          imagePullPolicy: IfNotPresent
+
+          # Flags append to the image ENTRYPOINT. queue-wait drops from its
+          # 30 s default so a busy pod answers 503 in half a second — the
+          # dashboard then retries onto an idle pod (a new connection re-rolls
+          # the Service's random routing) instead of queueing invisibly.
+          args: ["-queue-wait=500ms"]
+
+          ports:
+            - containerPort: 8080
+
+          env:
+            - name: MODEL
+              value: /models/qwen-2.5.gguf
+            - name: WORKERS
+              value: "1"
+            - name: CONTEXT
+              value: "2048"
+            # 4 replicas x 1 worker x 4 threads = 16 threads on 16 vCPUs
+            # (2x c7g.2xlarge). Full-speed streams, two per node.
+            - name: THREADS
+              value: "4"
+            - name: POD_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+            - name: NODE_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: spec.nodeName
+
+          volumeMounts:
+            - name: models
+              mountPath: /models
+              readOnly: true
+
+          resources:
+            requests:
+              memory: 256Mi
+              # Half the k3d request, matching the halved THREADS: two pods
+              # must fit per 4-vCPU node with room for system pods.
+              cpu: 250m
+            limits:
+              memory: 900Mi
+
+          readinessProbe:
+            httpGet:
+              path: /health/ready
+              port: 8080
+            periodSeconds: 2
+            failureThreshold: 2
+
+          livenessProbe:
+            httpGet:
+              path: /health/live
+              port: 8080
+            initialDelaySeconds: 10
+            periodSeconds: 10
+            failureThreshold: 3
+
+      volumes:
+        - name: models
+          hostPath:
+            path: /models
+            type: Directory
+
+      terminationGracePeriodSeconds: 65

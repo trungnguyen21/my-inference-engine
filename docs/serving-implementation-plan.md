@@ -92,7 +92,7 @@ the server can turn into a 400.
 
 ---
 
-## Phase 1 — Simplest possible endpoint
+## Phase 1 — Simplest possible endpoint  ✅ DONE
 
 *One request at a time. No streaming. No concurrency.*
 
@@ -114,6 +114,15 @@ POST /generate
 5. Reject bad input with 400 — prompt too long, `max_tokens` out of range.
 
 **Done when:** `curl` against a locally running server returns generated text.
+
+**Outcome.** `POST /generate` returns `{"text":...,"prompt_tokens":...,
+"generated_tokens":...,"truncated":...,"ms":...}`, with 400 on every invalid
+input and 500 only for genuine engine failures.
+
+One bug found late and worth remembering: validation ran on the trimmed prompt
+while the untrimmed one was sent to the engine, and the length check used `>`
+where the engine rejects at `>=`. Both turned a 400 into a 500. There are now
+boundary regression tests at exactly `PromptCapacity()`.
 
 **Watch out for:**
 
@@ -324,70 +333,338 @@ reports only that the process is alive.
 
 ---
 
-## Phase 5 — Kubernetes (both demos)
+## Phase 5 — Identity and the demo kit  ✅ DONE  (local, no cluster)
+
+Everything here works against `go run .`, Compose, or any cluster, so none of
+it is wasted if the EC2 step slips. It is also what every later phase depends
+on, which is why it comes first.
 
 **Tasks**
 
-1. `Deployment` (`replicas=4`, `WORKERS=1`), `Service`, resource requests/limits.
-2. Readiness probe tuned to the 4.2 s cold start (~`initialDelaySeconds: 5`).
-3. Expose the pod name via the Downward API and return it on every response —
-   this is what makes Demo C legible.
-4. **Demo A:** a small client script firing 4 concurrent streaming requests,
-   displayed side by side.
-5. **Demo C:** `kubectl delete pod` mid-request; show the failure, the
-   replacement pod starting, and traffic continuing.
+1. **Pod and node identity on every response.** Return `X-Served-By` and add
+   both to the `stats` event, from the Downward API:
 
-**Done when:** both demos are reproducible and recordable.
+   ```yaml
+   env:
+     - name: POD_NAME
+       valueFrom: { fieldRef: { fieldPath: metadata.name } }
+     - name: NODE_NAME
+       valueFrom: { fieldRef: { fieldPath: spec.nodeName } }
+   ```
 
-**Watch out for — this will bite:** Kubernetes' default load balancing picks a
-pod **at random**, not round-robin. Four simultaneous requests land on four
-distinct pods only ~9% of the time; usually one pod gets two (serialised) and
-another sits idle. Mitigations, in increasing order of effort:
+   Without the **node** name, four streams look identical whether they are on
+   one machine or two — which is the entire point of going multi-node.
 
-- Run Demo A as `WORKERS=4, replicas=1` instead, where dispatch is internal and
-  therefore perfect;
-- or have busy pods return 503 and let the client retry onto an idle pod;
-- or build the gateway (Phase 6).
+2. **`demo/loadgen`** — a closed-loop driver: keep K requests permanently in
+   flight, each finishing and immediately starting another. Print a live tally
+   per pod and node:
 
-Worth *showing* this problem before fixing it — it is a real distributed-systems
-lesson and makes a better story than hiding it.
+   ```
+   elapsed  rps   ok   err  │ node-1              │ node-2
+     12.3s  1.8   22    0   │ pod-abc  ███████ 7  │ pod-def  ████████ 8
+                            │ pod-ghi  ████    4  │ pod-jkl  ███     3
+   ```
+
+   This is what makes disruption legible: delete a pod and its bar stops
+   growing while the others absorb the load.
+
+   Two design points that matter more than they look:
+   - **Short requests** (`max_tokens: 8`). Each takes 2-5 s, so long outputs
+     would show three completions in a whole demo. Expect ~2 req/s with four
+     workers; this demo is about *where* requests go, not throughput.
+   - **Retry on 503.** Restarts produce `model is still loading` and
+     `all N workers busy`. Treating those as fatal makes resilience look like
+     an outage. Count them separately so nothing is hidden.
+
+3. **`demo/panes.html`** — four SSE streams side by side with `pod / node`
+   badges. Long requests (`max_tokens: 64`) here: this is the shot that proves
+   streaming, and it is a different shot from the traffic dashboard.
+
+4. **`demo/bench.sh`** — aggregate tokens/sec, to be run with one node
+   cordoned and then with both.
+
+**Done when:** the dashboard and panes work against a local server.
+
+**Outcome.** `demo/loadgen`, `demo/bench.sh`, `demo/README.md`, and the
+streaming page — plus pod/node identity on every response.
+
+Four decisions worth keeping:
+
+- **The streaming page is served by the server itself** at `/demo`, embedded
+  with `go:embed`. That sidesteps CORS (page and API share an origin) and needs
+  no volume mount, so it works unchanged in a container and behind a NodePort.
+- **`bench.sh` drives `loadgen`** rather than reimplementing it, so request
+  shape and retry accounting cannot drift between the two.
+- **`bench.sh` warms up before measuring.** The first request pays for OpenMP
+  team creation and for faulting the weights into the page cache.
+- **A pod that stops answering is marked, not dropped**, from the tally — so a
+  deletion stays visible instead of silently disappearing.
+
+**Bugs found while building it:**
+
+- A failed listener exited 0, so systemd's `Restart=on-failure` never fired and
+  Kubernetes would have read the container as completed successfully. `main` is
+  now a wrapper over `run() error`.
+- `loadgen` retried connection failures with no backoff: **311,173 failures in
+  20 s** against a dead server. Now 500 ms on 503 and 2 s on hard failure.
+- Requests cancelled by `loadgen`'s own shutdown were counted as failures, so
+  every run ended with a misleading error count. They are now a separate
+  `aborted` outcome that is not tallied.
+
+**Verification note.** The browser extension was unavailable, so the page's DOM
+behaviour is unverified. Its SSE parsing loop was extracted and run under node
+against a real captured stream, which produced the correct text, stats, and
+`[DONE]` — that is the part most likely to be wrong, but a browser check is
+still owed.
 
 ---
 
-## Phase 6 — Later
+## Phase 6 — Docker Compose  ✅ DONE  (one host)
+
+A deliberate stepping stone, not a detour. ~20 lines, no cost, and it isolates
+"is the image right" from "is the cluster right".
+
+**Tasks**
+
+1. `compose.yaml` with `deploy.replicas: 4`, the model mounted read-only, and
+   a healthcheck.
+2. Point the demo kit at it. Confirm four-way concurrency and the identity
+   labels.
+
+**Done when:** `docker compose up --scale engine=4` serves the dashboard.
+
+**Outcome.** `compose.yaml` plus `deploy/nginx.conf`. Image is **140 MiB,
+linux/arm64**. Two replicas behind an nginx gateway split traffic evenly
+(5/5 over ten requests, 14/14 over a 30 s loadgen run), and `loadgen` shows
+both pods grouped under one node.
+
+Streaming survives the proxy: tokens arrive ~50 ms apart through nginx, because
+`proxy_buffering off` is set. Leaving it on is the silent failure where the
+whole answer lands at once.
+
+**The image did not build on the first attempt.** llama.cpp's ggml-cpu failed
+with `inlining failed in call to always_inline vfmaq_f16: target specific
+option mismatch` — ggml probed the build host's CPU and produced a `-march`
+string enabling fp16 vector arithmetic without enabling fp16 itself. Fixed with
+`-DGGML_NATIVE=OFF`, which is the more correct choice anyway: this image is
+built in a Linux VM on an Apple M2 and will run on Graviton, so baking
+host-detected CPU features in risks illegal instructions. It costs nothing,
+because llama.cpp is used only for its tokenizer.
+
+**nginx needed a shared-memory zone.** `server engine:8080 resolve` requires
+`zone engine_pool 64k`, or nginx refuses to start. With it, scaling via
+`docker compose up --scale engine=N` is picked up without restarting the proxy.
+
+### Measured: what Compose cannot do
+
+A restart under load, with `loadgen` running 4 concurrent users:
+
+```
+ran 55s: 42 ok, 0 busy, 22 failed, 336 tokens
+nginx:   22 x HTTP 502, "no live upstreams" x21
+```
+
+**34 % of requests failed.** `docker compose restart` stopped *both* replicas at
+once — they came back with identical uptime — leaving a window with zero
+backends. There is no `maxUnavailable`, no waiting for a replacement to be
+ready, and nginx open-source does no active health checking, so the healthcheck
+that correctly marked the containers unhealthy gated nothing.
+
+Under Kubernetes the same operation is `kubectl rollout restart`, which replaces
+pods one at a time and will not route to one until its readiness probe passes.
+That contrast — 34 % failures versus ~0 — is the single clearest demonstration
+of what an orchestrator buys, and it is worth filming both halves.
+
+**What Compose cannot do** — worth seeing first-hand, because it is the
+argument for the next phase:
+
+- **No readiness gating.** Compose's DNS hands out every replica's IP
+  regardless of healthcheck state, so a container still inside its ~4 s model
+  load already receives traffic. The `/health/live` vs `/health/ready` split
+  from Phase 4 is inert here.
+- **No rolling updates.** No `maxSurge`/`maxUnavailable`, no waiting for a new
+  container to be ready before killing the old one, no rollback.
+- **No reconciliation loop.** Compose applies the file once; `restart: always`
+  covers crashes but not the general case.
+- **One machine, by definition.**
+
+A rolling restart under Compose dropping requests, then the same under
+Kubernetes not dropping them, is a better demo than either alone.
+
+---
+
+## Phase 7 — k3d multi-node  (local, still free)
+
+Real manifests, nodes as containers. Debugging YAML here costs nothing;
+debugging it against rented machines costs money and patience.
+
+**Tasks**
+
+1. `k3d cluster create --agents 2`, then load the image with `k3d image import`.
+2. `k8s/`: `Deployment` (`replicas=4`, `WORKERS=1`), `Service`,
+   resource requests/limits, and probes tuned to the measured 4.2 s cold start
+   (`readinessProbe` ~`initialDelaySeconds: 5, periodSeconds: 2`;
+   `livenessProbe` on `/health/live`, which must **not** depend on the model).
+3. The Downward API env block from Phase 5.
+4. `topologySpreadConstraints` so replicas actually land on different nodes
+   rather than piling onto one.
+5. **Model delivery flips here.** Mounting from the host only works on one
+   machine; a pod must be able to start on any node. Bake it into the image
+   (`COPY models/ /models/`, drop `models/` from `.dockerignore`) or pull from
+   object storage via an initContainer.
+
+**Done when:** `kubectl get pods -o wide` shows pods on both agents and the
+dashboard shows two node names.
+
+**Expose it with a NodePort, not an Ingress.** k3s ships Traefik, and proxies
+buffer streaming responses — if tokens arrive in one burst, that is why. Fewer
+layers is also more honest about what is being demonstrated.
+
+**This will bite:** Kubernetes' default load balancing picks a backend **at
+random**, not round-robin. Four simultaneous requests reach four distinct pods
+only ~9 % of the time; usually one pod gets two (serialised) and another idles.
+Mitigations, in increasing effort: run the streaming demo as
+`WORKERS=4, replicas=1` where dispatch is internal and therefore perfect; rely
+on the 503-and-retry the loadgen already does; or build the gateway (Phase 9).
+
+Worth *showing* before fixing — it is a real distributed-systems lesson.
+
+---
+
+## Phase 8 — Two EC2 nodes  (the real demo)
+
+**Why bother, in one sentence:** memory bandwidth is **per machine**, so adding
+machines is the only change in this entire project that genuinely increases
+aggregate tokens/sec.
+
+Everything measured so far says concurrency on one box does not add throughput
+because requests contend for the same RAM bandwidth. Two machines have two
+memory subsystems. Expect roughly 2x — a prediction from a diagnosis, which
+reads very differently from "I added servers and it got faster".
+
+**Topology**
+
+```
+   MacBook                      AWS VPC
+   ┌─────────┐          ┌──────────────┬──────────────┐
+   │ kubectl ├─ HTTPS ──► node-1       │ node-2       │
+   └─────────┘  (SG      │ k3s server  │ k3s agent    │
+              locked to  │ + engine pod│ + engine pod │
+              your IP)   └──────────────┴──────────────┘
+```
+
+**Not** the MacBook as control plane. Two separate things get conflated there:
+running the control plane, and running `kubectl`. Only the second is wanted,
+and driving a remote cluster from a laptop is the normal arrangement. A
+home-NAT control plane means exposing an API server through a dynamic-IP router
+to kubelets that must reach it, the control-plane components are Linux-only so
+they would sit in a VM behind that NAT, and etcd flaps when the lid closes.
+
+**Tasks**
+
+1. Two **arm64 Graviton** instances (`c7g.xlarge` or similar). arm64 matters:
+   the engine's NEON kernels are used rather than the scalar fallback. Avoid
+   `t`-class burstable — CPU credits throttle sustained inference, which is
+   exactly this workload.
+2. k3s server on node-1, agent on node-2. Security group opens the API port to
+   your IP only.
+3. Same manifests as Phase 7, unchanged. That is the whole point of rehearsing.
+4. **Set a billing alarm and stop the instances afterwards.** ~$0.30/hr for the
+   pair is a few dollars for an afternoon and ~$210/month if forgotten.
+
+**Done when:** `bench.sh` with one node cordoned, then both, shows the ~2x.
+
+---
+
+## The demo itself
+
+**The deliverable is a recording, not a live cluster.** Nobody will SSH in, and
+paying to keep instances up on the chance they might is waste. A recording also
+means a failed live demo cannot embarrass you.
+
+Run `demo/loadgen` in one terminal pane and `kubectl` in another, side by side,
+so the disruption and the response land in the same frame.
+
+Every step below is a command **you type**. Nothing fires on its own — and that
+is the point: you cause a disturbance, Kubernetes reacts without you.
+
+| You type | Kubernetes does, unprompted |
+|---|---|
+| `kubectl get nodes -o wide` | — (two real machines) |
+| `kubectl get pods -o wide` | — (spread across both) |
+| *(open panes.html)* | — (badges show two node names) |
+| `kubectl cordon` / bench / `uncordon` / bench | — (the ~2x) |
+| `kubectl exec <pod> -- kill 1` | kubelet restarts the container |
+| `kubectl delete pod` | schedules a replacement, waits for readiness before routing to it |
+| `kubectl drain node-2` | evicts and reschedules onto node-1 |
+| `kubectl rollout restart` | replaces pods one at a time, each gated on readiness |
+
+`drain` and the throughput measurement are the two steps **only multi-node
+gives you**. `drain` is also precisely what Compose structurally cannot do.
+
+**Script it** (`demo/run-demo.sh`) rather than typing live: deterministic,
+repeatable after a fix, no dead air during model loads, and readable as a
+deliverable in its own right.
+
+**Do not edit out the slow parts.** A replacement pod sits `0/1 Running` for
+several seconds while the model loads. That is the system working, and it is
+the clearest justification for the liveness/readiness split.
+
+**Mention, but do not film, node failure.** Terminating an instance does
+recover automatically — but it takes ~40 s to mark the node `NotReady` plus a
+~300 s toleration before pods are evicted. Five to six minutes of nothing.
+Knowing why it is slow, and that it is tunable, is worth a paragraph in the
+writeup; `drain` is what you actually demo.
+
+---
+
+## Phase 9 — Later
 
 - **Gateway**: one front door with a queue that tracks idle workers, giving
-  proper least-busy routing. This is Phase 3's queue moved out into its own pod.
+  proper least-busy routing instead of kube-proxy's random choice. This is
+  Phase 3's queue moved into its own pod.
 - **OpenAI-compatible endpoint** (`/v1/chat/completions`) so off-the-shelf chat
   UIs and SDKs work against this engine. Needs multi-turn prompt formatting —
   `engine_format_prompt` currently handles a single user message only.
-- **Benchmarking** — aggregate tokens/sec at 1/2/4 workers.
-- **HPA / autoscaling.** Note CPU-based scaling is a poor signal here (CPU is
-  pinned at 100% by design during generation); queue depth is the real metric,
-  which needs KEDA or prometheus-adapter.
+- **HPA / autoscaling.** CPU is a poor signal here (pinned at 100 % by design
+  during generation); queue depth is the real metric, which needs KEDA or
+  prometheus-adapter. On a two-node cluster the useful ceiling is small.
 - **Real sampling** (temperature / top-p), which then unlocks the API field.
 - **Native tokenizer** — `src/tokenizer.cpp:62` loads the whole model a second
-  time through llama.cpp just to get the vocabulary, which is a large part of
-  the 4.2 s cold start.
+  time through llama.cpp just for the vocabulary. Removing it drops five of the
+  six runtime shared libraries and most of the 4.2 s cold start, which also
+  makes pod replacement visibly faster.
+- **Batching** — the only remaining change that would raise throughput on a
+  single machine, and the one thing on this list that is squarely an engine
+  project rather than a serving one.
 
 ---
 
-## Deferred decisions
+## Decisions, resolved
 
-Still open; none block Phase 0 or 1.
-
-1. **Max context ceiling** — 1024 / 2048 / 4096. Controls worker memory (table above).
-2. **Static vs dynamic linking of the engine** — statically linking
-   `libengine.a` into the Go binary would give a single self-contained
-   executable, but linking llama.cpp and OpenMP statically is fiddly. Dynamic
-   linking is the safe default.
-3. **Model delivery** — baked into the image (self-contained, portable to real
-   multi-node clusters, ~600 MB image) vs mounted from the host (~30 MB image,
-   much faster iteration, laptop-only shortcut).
+1. **Max context ceiling — 1024**, as the `-context` / `CONTEXT` default.
+   ~29 MB per worker; four workers ~116 MB. Startup logs the estimate before
+   allocating.
+2. **Linking — dynamic.** `CGO_ENABLED=1` makes a static binary impossible, so
+   the runtime image is `debian-bookworm-slim` plus libengine and the five
+   llama.cpp/ggml shared objects in `/usr/local/lib`. Not `scratch`.
+3. **Model delivery — mounted for one host, baked in for a cluster.** Mounting
+   keeps the image ~120 MB and rebuilds in seconds, and guarantees replicas on
+   one node share an inode. It stops working the moment pods must be
+   schedulable on any node, so Phase 7 switches to baking it in.
+4. **Control plane — on the cluster, not the MacBook.** `kubectl` runs on the
+   laptop; that is all that was ever wanted there.
+5. **Ingress — NodePort for the demo.** Proxies buffer SSE, and fewer layers is
+   more honest about what is being shown.
 
 ---
 
 ## What Kubernetes does and doesn't buy here
+
+> Written before the multi-node plan existed. Still accurate **for one
+> machine**, which is why Phases 6-8 escalate deliberately rather than jumping
+> to a cluster. The one thing missing below: on *two* machines Kubernetes does
+> buy throughput, because memory bandwidth is per machine. See Phase 8.
 
 Stated plainly, because a portfolio reviewer will ask.
 

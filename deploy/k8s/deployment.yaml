@@ -1,0 +1,116 @@
+# The Kubernetes counterpart of compose.yaml's `engine` service — and the
+# answer to the limitations listed at the top of that file.
+#
+# A Deployment is not "run these containers"; it is "keep this many replicas
+# existing and ready, forever". Kill a pod and the controller notices the count
+# is wrong and makes a new one. That is the reconciliation loop Compose lacks.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: engine
+spec:
+  replicas: 2
+
+  # How the Deployment finds its pods: by label, not by name.
+  selector:
+    matchLabels:
+      app: engine
+
+  # Rolling updates, which Compose cannot do at all: bring up 1 extra pod,
+  # wait for it to be Ready, only then stop an old one. Never dip below the
+  # replica count.
+  strategy:
+    rollingUpdate:
+      maxSurge: 1
+      maxUnavailable: 0
+
+  template:
+    metadata:
+      labels:
+        app: engine
+    spec:
+      containers:
+        - name: engine
+          image: inference-engine:dev
+          # The image was side-loaded (`k3d image import`), it is not in any
+          # registry. Never = fail loudly instead of trying to pull.
+          imagePullPolicy: Never
+
+          ports:
+            - containerPort: 8080
+
+          env:
+            - name: MODEL
+              value: /models/qwen-2.5.gguf
+            - name: WORKERS
+              value: "1"
+            - name: CONTEXT
+              value: "2048"
+            # Same oversubscription math as compose.yaml: replicas x workers
+            # x threads must not exceed the cores actually available.
+            - name: THREADS
+              value: "4"
+            # The Downward API: the kubelet injects the pod's own identity as
+            # env vars. This replaces compose.yaml's hand-set NODE_NAME and
+            # hostname fallback — here the values are real.
+            - name: POD_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+            - name: NODE_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: spec.nodeName
+
+          volumeMounts:
+            - name: models
+              mountPath: /models
+              readOnly: true
+
+          resources:
+            requests:
+              # What the scheduler reserves when choosing a node. Kept low so
+              # two pods fit comfortably per node during scale demos.
+              memory: 256Mi
+              cpu: 500m
+            limits:
+              # Same ceiling as compose.yaml; the mmap'd model stays shared
+              # via the page cache, so it is not counted per pod.
+              memory: 900Mi
+
+          # The split that was inert under Compose finally does something:
+          #
+          # readiness — "may traffic be routed to me?" Fails during the ~4 s
+          # model load, so the Service sends requests only to pods that can
+          # actually answer. This is the readiness gating Compose lacks.
+          readinessProbe:
+            httpGet:
+              path: /health/ready
+              port: 8080
+            periodSeconds: 2
+            failureThreshold: 2
+
+          # liveness — "am I alive at all?" Failing this gets the container
+          # restarted. Deliberately slow and tolerant: restarting a pod that
+          # is merely busy would make an overload strictly worse.
+          livenessProbe:
+            httpGet:
+              path: /health/live
+              port: 8080
+            initialDelaySeconds: 10
+            periodSeconds: 10
+            failureThreshold: 3
+
+      volumes:
+        # hostPath = "a directory on whichever node the pod landed on".
+        # In k3d that is the --volume mount of ./models; on EC2 the bootstrap
+        # script downloads the model to the same path on every node.
+        - name: models
+          hostPath:
+            path: /models
+            type: Directory
+
+      # Matches the server's 60 s drain (compose.yaml's stop_grace_period):
+      # on shutdown the pod gets SIGTERM, finishes in-flight generations, and
+      # only after 65 s would it be killed.
+      terminationGracePeriodSeconds: 65
