@@ -197,8 +197,8 @@ async function runPane(i, maxTokens, signal) {
           parts.push(`<b>${s.generated_tokens}</b> tokens`);
           parts.push(`total <b>${s.ms} ms</b>`);
           if (s.generated_tokens > 1 && s.ms > s.ttft_ms) {
-            const perTok = (s.ms - s.ttft_ms) / (s.generated_tokens - 1);
-            parts.push(`${Math.round(perTok)} ms/tok`);
+            const perTok = 1000 * (s.generated_tokens - 1) / (s.ms - s.ttft_ms);
+            parts.push(`${Math.round(perTok)} tok/s`);
           }
           if (s.prompt_tokens) parts.push(`prompt ${s.prompt_tokens}`);
           if (s.truncated)     parts.push("truncated");

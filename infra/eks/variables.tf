@@ -24,12 +24,12 @@ variable "instance_type" {
     Graviton (arm64) for the NEON kernels, non-burstable for sustained load —
     same reasoning as ../variables.tf.
 
-    c7g.xlarge = 4 vCPU, 8 GiB per node. The capacity budget is
+    c7g.2xlarge = 8 vCPU, 16 GiB per node. The capacity budget is
     (parallel generations x THREADS) <= total vCPUs: with 2 nodes that is
-    8 cores, so 4 pods x THREADS=2 serves 4 concurrent streams.
+    16 cores, so 4 pods x THREADS=4 serves 4 full-speed concurrent streams.
   EOT
   type        = string
-  default     = "c7g.xlarge"
+  default     = "c7g.2xlarge"
 }
 
 variable "allowed_cidr" {

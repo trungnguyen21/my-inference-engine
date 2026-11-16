@@ -121,10 +121,14 @@ resource "aws_eks_cluster" "engine" {
 # aws_instance count. Graviton for the same reason as before — the engine's
 # NEON kernels — hence the ARM AMI type.
 resource "aws_eks_node_group" "workers" {
-  cluster_name    = aws_eks_cluster.engine.name
-  node_group_name = "inference-workers"
-  node_role_arn   = aws_iam_role.node.arn
-  subnet_ids      = data.aws_subnets.default.ids
+  cluster_name = aws_eks_cluster.engine.name
+  # A prefix rather than a fixed name, so that create_before_destroy below
+  # can stand up the replacement group while the old one still exists — a
+  # fixed name would collide and force destroy-first (minutes of zero
+  # capacity on an instance-type change).
+  node_group_name_prefix = "inference-workers-"
+  node_role_arn          = aws_iam_role.node.arn
+  subnet_ids             = data.aws_subnets.default.ids
 
   instance_types = [var.instance_type]
   ami_type       = "AL2023_ARM_64_STANDARD"
@@ -134,6 +138,14 @@ resource "aws_eks_node_group" "workers" {
     desired_size = var.node_count
     min_size     = var.node_count
     max_size     = var.node_count + 1 # headroom for a live "add a node" demo
+  }
+
+  # On a change that replaces the group (e.g. instance type), build the new
+  # group first, let its nodes join and go Ready, and only then drain and
+  # destroy the old one. Pods reschedule onto the new nodes instead of going
+  # Pending with no workers at all.
+  lifecycle {
+    create_before_destroy = true
   }
 
   depends_on = [
