@@ -2,12 +2,9 @@
 #
 #   1. image: pulled from ECR (nodes authenticate via their IAM role), not
 #      sideloaded with `k3d image import`.
-#   2. replicas 4 x THREADS 2 instead of 2 x 4: the 2-node c7g.xlarge budget
-#      is 8 vCPUs, and 4 x 2 trades some per-stream speed for 4 genuinely
-#      concurrent streams — the multi-panel dashboard layout.
-#   3. an initContainer gates startup on the model file, because the
+#   2. an initContainer gates startup on the model file, because the
 #      model-download DaemonSet races the scheduler on a fresh node.
-#   4. hostPath is Directory (strict) — creating it is the DaemonSet's job.
+#   3. hostPath is Directory (strict) — creating it is the DaemonSet's job.
 #
 # Everything not commented here is explained in ../deployment.yaml.
 apiVersion: apps/v1
@@ -28,6 +25,14 @@ spec:
       labels:
         app: engine
     spec:
+      topologySpreadConstraints:
+        - maxSkew: 1
+          topologyKey: kubernetes.io/hostname
+          whenUnsatisfiable: DoNotSchedule
+          labelSelector:
+            matchLabels:
+              app: engine
+
       # Runs to completion before the engine container is allowed to start.
       # Waits (rather than downloads) so 4 replicas cannot fetch the model 4
       # times; the DaemonSet stays the single writer, this is just a latch.
@@ -49,8 +54,14 @@ spec:
 
       containers:
         - name: engine
-          image: 327319899002.dkr.ecr.ca-central-1.amazonaws.com/inference-engine:dev
+          image: 327319899002.dkr.ecr.ca-central-1.amazonaws.com/inference-engine:1dd1c9f
           imagePullPolicy: IfNotPresent
+
+          # Flags append to the image ENTRYPOINT. queue-wait drops from its
+          # 30 s default so a busy pod answers 503 in half a second — the
+          # dashboard then retries onto an idle pod (a new connection re-rolls
+          # the Service's random routing) instead of queueing invisibly.
+          args: ["-queue-wait=500ms"]
 
           ports:
             - containerPort: 8080
@@ -62,9 +73,10 @@ spec:
               value: "1"
             - name: CONTEXT
               value: "2048"
-            # 4 replicas x 1 worker x 2 threads = 8 threads on 8 vCPUs.
+            # 4 replicas x 1 worker x 4 threads = 16 threads on 16 vCPUs
+            # (2x c7g.2xlarge). Full-speed streams, two per node.
             - name: THREADS
-              value: "2"
+              value: "4"
             - name: POD_NAME
               valueFrom:
                 fieldRef:

@@ -8,6 +8,8 @@
 # debian-slim rather than scratch: it needs libc, libstdc++, libgomp, and the
 # engine's own shared libraries.
 # ---------------------------------------------------------------------------
+# No -slim here: golang images have no slim variant, and this is a discarded
+# build stage anyway — only the runtime stage's size reaches production.
 FROM golang:1.26-bookworm AS build
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
@@ -56,7 +58,7 @@ RUN CGO_ENABLED=1 go build -trimpath -o /out/server .
 # ---------------------------------------------------------------------------
 # Stage 2: runtime.
 # ---------------------------------------------------------------------------
-FROM debian:bookworm-slim AS runtime
+FROM debian:trixie-slim AS runtime
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
         libgomp1 libstdc++6 ca-certificates curl \

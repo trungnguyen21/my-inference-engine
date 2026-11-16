@@ -4,7 +4,11 @@
 <style>
   :root { color-scheme: dark; --bg:#14161a; --panel:#1c1f26; --line:#2b2f38;
           --text:#e6e8ec; --dim:#8b919e; --accent:#6ee7a8; --warn:#f6b26b;
-          --err:#f08a8a; }
+          --err:#f08a8a;
+          /* Panes are a fixed height so the grid does not reflow as output
+             arrives. A growing pane makes every other pane jump, which is
+             exactly the wrong thing while you are watching four at once. */
+          --pane-h:280px; }
   * { box-sizing: border-box; }
   body { margin:0; padding:20px; background:var(--bg); color:var(--text);
          font:14px/1.5 ui-monospace, SFMono-Regular, Menlo, monospace; }
@@ -20,9 +24,10 @@
           border:1px solid var(--line); background:var(--bg); color:var(--text); }
   .grid { display:grid; grid-template-columns:repeat(auto-fit,minmax(300px,1fr)); gap:12px; }
   .pane { border:1px solid var(--line); border-radius:8px; background:var(--panel);
-          padding:12px; display:flex; flex-direction:column; min-height:190px; }
+          padding:12px; display:flex; flex-direction:column;
+          height:var(--pane-h); }
   .head { display:flex; justify-content:space-between; align-items:center;
-          gap:8px; margin-bottom:8px; }
+          gap:8px; margin-bottom:8px; flex:none; }
   .who { font-size:11px; color:var(--dim); overflow:hidden; text-overflow:ellipsis;
          white-space:nowrap; }
   .who b { color:var(--accent); font-weight:600; }
@@ -30,9 +35,20 @@
   .dot.live { background:var(--accent); }
   .dot.wait { background:var(--warn); }
   .dot.err  { background:var(--err); }
-  .out { flex:1; white-space:pre-wrap; word-break:break-word; font-size:13px; }
+  .out { flex:1; white-space:pre-wrap; word-break:break-word; font-size:13px;
+          overflow-y:auto; overscroll-behavior:contain;
+          /* min-height:0 is load-bearing. A flex item will not shrink below
+             its content size by default, so without it the pane grows to fit
+             the text and overflow-y never engages. */
+          min-height:0;
+          scrollbar-width:thin; scrollbar-color:var(--line) transparent; }
+  .out::-webkit-scrollbar { width:8px; }
+  .out::-webkit-scrollbar-track { background:transparent; }
+  .out::-webkit-scrollbar-thumb { background:var(--line); border-radius:4px; }
+  .out::-webkit-scrollbar-thumb:hover { background:#3a3f4a; }
   .meta { margin-top:8px; font-size:11px; color:var(--dim); border-top:1px solid var(--line);
-          padding-top:6px; min-height:17px; display:flex; gap:10px; flex-wrap:wrap; }
+          padding-top:6px; min-height:17px; display:flex; gap:10px; flex-wrap:wrap;
+          flex:none; }
   .meta.bad { color:var(--err); }
   .meta b { color:var(--text); font-weight:600; }
   .ttft b { color:var(--accent); }
@@ -50,6 +66,7 @@
   <button id="go">Start all</button>
   <button id="stop" disabled>Stop</button>
   <label>panes <input id="panes" type="number" value="4" min="1" max="8"></label>
+  <label>pane height <input id="paneh" type="number" value="280" min="140" max="900" step="20"></label>
   <label>max_tokens <input id="toks" type="number" value="64" min="1" max="512"></label>
   <span id="note" class="who"></span>
 </div>
@@ -82,18 +99,67 @@ function makePane(i) {
   return el;
 }
 
-// EventSource is GET-only and this endpoint is a POST, so the SSE framing is
-// parsed by hand off a fetch body stream. Events are separated by a blank line.
+// A pane's request is retried, with two distinct triggers:
+//
+//   busy   — the pod answered 503 (queue-wait expired). A retry opens a new
+//            connection, which re-rolls the Service's random pod choice; with
+//            any pod idle, a few rolls find it. This is how four panes end up
+//            on four distinct pods without anyone coordinating them.
+//   broken — the stream died without [DONE] (pod killed, node gone). The
+//            generation restarts from scratch on whichever pod answers next;
+//            there is no resume, same as real LLM APIs.
+//
+// Anything else (400s, aborts) is final — retrying a malformed request would
+// just fail identically forever.
+const MAX_ATTEMPTS = 5;
+
 async function runPane(i, maxTokens, signal) {
   const dot = document.getElementById(`dot${i}`);
   const who = document.getElementById(`who${i}`);
   const out = document.getElementById(`out${i}`);
   const meta = document.getElementById(`meta${i}`);
+  const els = { dot, who, out, meta };
+
+  // Every attempt's pod and fate, rendered into the meta line so the routing
+  // history stays visible: "pod-a ✗busy → pod-b ✓".
+  const history = [];
+
+  for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
+    const result = await streamOnce(i, maxTokens, signal, els, history, attempt);
+    if (result === "done" || result === "fatal" || signal.aborted) return;
+
+    if (attempt === MAX_ATTEMPTS) break; // out of attempts; fall through to give up
+
+    // busy/broken: back off briefly before the re-roll. Linear + jitter —
+    // enough to let a draining pod leave the endpoint list, short enough
+    // that a retry is visibly "immediate" on screen.
+    const delay = 300 * attempt + Math.random() * 300;
+    dot.className = "dot wait";
+    who.textContent = `pane ${i + 1} — ${result}, retry ${attempt + 1}/${MAX_ATTEMPTS} in ${Math.round(delay)} ms`;
+    await new Promise(r => setTimeout(r, delay));
+    if (signal.aborted) return;
+  }
+
+  dot.className = "dot err";
+  who.textContent = `pane ${i + 1} — gave up`;
+  meta.className = "meta bad";
+  meta.textContent = `gave up after ${MAX_ATTEMPTS} attempts (${historyText(history)}) — capacity full or service down`;
+}
+
+function historyText(history) {
+  return history.map(h => `${h.pod} ${h.ok ? "✓" : "✗" + h.why}`).join(" → ");
+}
+
+// EventSource is GET-only and this endpoint is a POST, so the SSE framing is
+// parsed by hand off a fetch body stream. Events are separated by a blank line.
+// Returns "done" | "busy" | "broken" | "fatal".
+async function streamOnce(i, maxTokens, signal, els, history, attempt) {
+  const { dot, who, out, meta } = els;
   out.textContent = "";
-  meta.textContent = "";
   meta.className = "meta";
+  meta.textContent = attempt > 1 ? historyText(history) : "";
   dot.className = "dot wait";
-  who.textContent = `pane ${i + 1} — connecting`;
+  who.textContent = `pane ${i + 1} — connecting (attempt ${attempt})`;
 
   const startedAt = performance.now();
   let resp;
@@ -109,25 +175,30 @@ async function runPane(i, maxTokens, signal) {
       signal,
     });
   } catch (e) {
-    if (signal.aborted) { dot.className = "dot"; who.textContent = `pane ${i+1} — stopped`; return; }
-    dot.className = "dot err";
-    meta.className = "meta bad";
-    meta.textContent = String(e);
-    return;
+    if (signal.aborted) { dot.className = "dot"; who.textContent = `pane ${i+1} — stopped`; return "fatal"; }
+    // The fetch itself failed — connection refused/reset, e.g. the NodePort
+    // entry briefly unreachable. Retryable.
+    history.push({ pod: "no-connection", ok: false, why: "net" });
+    return "broken";
   }
 
   // The header is set on every response, errors included, so a pane can show
   // which pod refused it and not just which one served it.
   const served = resp.headers.get("X-Served-By") || "unknown";
   const [pod, node] = served.includes("/") ? served.split("/") : [served, ""];
-  who.innerHTML = node ? `<b>${node}</b> &middot; ${pod}` : `<b>${pod}</b>`;
+  who.innerHTML = (node ? `<b>${node}</b> &middot; ${pod}` : `<b>${pod}</b>`) +
+                  (attempt > 1 ? ` &middot; attempt ${attempt}` : "");
 
+  if (resp.status === 503) {
+    history.push({ pod, ok: false, why: "busy" });
+    return "busy";
+  }
   if (!resp.ok) {
     const body = await resp.text().catch(() => "");
     dot.className = "dot err";
     meta.className = "meta bad";
     meta.textContent = `HTTP ${resp.status} — ${body.slice(0, 120)}`;
-    return;
+    return "fatal";
   }
 
   dot.className = "dot live";
@@ -180,8 +251,8 @@ async function runPane(i, maxTokens, signal) {
           parts.push(`<b>${s.generated_tokens}</b> tokens`);
           parts.push(`total <b>${s.ms} ms</b>`);
           if (s.generated_tokens > 1 && s.ms > s.ttft_ms) {
-            const perTok = (s.ms - s.ttft_ms) / (s.generated_tokens - 1);
-            parts.push(`${Math.round(perTok)} ms/tok`);
+            const perTok = 1000 * (s.generated_tokens - 1) / (s.ms - s.ttft_ms);
+            parts.push(`${Math.round(perTok)} tok/s`);
           }
           if (s.prompt_tokens) parts.push(`prompt ${s.prompt_tokens}`);
           if (s.truncated)     parts.push("truncated");
@@ -191,7 +262,18 @@ async function runPane(i, maxTokens, signal) {
         continue;
       }
       try {
+        // Decide whether to follow BEFORE appending: once the text is in, the
+        // scroll metrics have already changed. A small tolerance keeps it
+        // sticky when the user is within a line or two of the bottom.
+        const following =
+          out.scrollHeight - out.scrollTop - out.clientHeight < 24;
+
         out.textContent += JSON.parse(data).token;
+
+        // Only auto-scroll if they were already at the bottom. Yanking the
+        // view back while someone is reading earlier output is worse than not
+        // following at all.
+        if (following) out.scrollTop = out.scrollHeight;
         // Report TTFT the moment it is known. Waiting for the stats event
         // would hide the single most interesting number until the end.
         if (firstTokenAt === null) {
@@ -203,16 +285,23 @@ async function runPane(i, maxTokens, signal) {
     }
   }
 
-  // The absence of [DONE] is how truncation is detected: the server only sends
-  // it on success, so a stream that stops without it was cut short.
+  // The absence of [DONE] is how a cut stream is detected: the server only
+  // sends it on success, so a stream that stops without it died mid-flight —
+  // the retryable case this whole loop exists for.
   if (!sawDone && !signal.aborted) {
-    meta.className = "meta bad";
-    meta.textContent += meta.textContent ? "  ·  stream ended without [DONE]"
-                                         : "stream ended without [DONE]";
-    dot.className = "dot err";
-  } else {
-    dot.className = "dot";
+    history.push({ pod, ok: false, why: "cut" });
+    return "broken";
   }
+
+  dot.className = "dot";
+  history.push({ pod, ok: true });
+  // Keep the routing story on screen next to the stats when it took more
+  // than one attempt to get here.
+  if (history.length > 1) {
+    meta.innerHTML = `${historyText(history)}` +
+                     (meta.innerHTML ? ` &middot; ${meta.innerHTML}` : "");
+  }
+  return "done";
 }
 
 function stopAll() {
@@ -246,6 +335,13 @@ document.getElementById("go").onclick = async () => {
 };
 
 document.getElementById("stop").onclick = stopAll;
+
+// Pane height is adjustable because the useful size depends on max_tokens: a
+// 64-token answer fits in 280px, a 512-token one does not.
+document.getElementById("paneh").oninput = (e) => {
+  const h = Math.max(140, Math.min(900, +e.target.value || 280));
+  document.documentElement.style.setProperty("--pane-h", h + "px");
+};
 
 fetch("/health").then(r => r.json()).then(h => {
   document.getElementById("note").textContent =

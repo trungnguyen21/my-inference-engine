@@ -215,6 +215,11 @@ func (s *server) writeGenerateError(w http.ResponseWriter, err error) {
 		// instead of leaving it to guess.
 		workers, _, _, _ := s.snapshot()
 		w.Header().Set("Retry-After", "1")
+		// Hang up after rejecting. Browsers pool keep-alive connections, and
+		// Kubernetes Services route per CONNECTION — so a retry on a reused
+		// connection lands on this same busy pod forever. Closing forces the
+		// client's retry onto a fresh connection, which re-rolls the pod.
+		w.Header().Set("Connection", "close")
 		writeError(w, http.StatusServiceUnavailable,
 			fmt.Sprintf("all %d workers busy; retry shortly", workers))
 	case errors.Is(err, context.Canceled), errors.Is(err, context.DeadlineExceeded):
