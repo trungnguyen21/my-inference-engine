@@ -22,6 +22,19 @@ The [optimization roadmap](docs/optimization-roadmap.md) ranks proposed changes
 from small math fixes through one-pass prefill, KV caching, CPU kernels, and a
 GPU backend, with expected benefits and validation requirements.
 
+## Architecture
+
+End to end: the C++ engine behind a stable C ABI, a Go server that pools
+sessions and streams tokens over it via cgo, and three deployment layers —
+Docker Compose, k3d, and AWS EKS — running copies of that server behind a
+load balancer.
+
+![Architecture diagram of the inference engine, Go server, and deployment layers](media/architect-diagram.png)
+
+## Demo
+
+<video src="media/demo.mp4" controls muted playsinline width="100%"></video>
+
 ## Inside the engine
 
 ### Grouped-query attention
@@ -122,6 +135,16 @@ holds the read-only weights and is shared across threads, while an
 reusable with no reallocation, and several can generate concurrently on one
 handle.
 
+Each request crosses two thread pools that do not coordinate: Go admits it
+through a buffered channel of sessions (the pool, the queue, and the semaphore
+in one), then a single cgo call hands it to the engine, where OpenMP fans it
+out across its own thread team. The diagram shows two admitted requests and a
+third queuing until the wait expires into a 503:
+
+![Request lifecycle: three requests hit the session pool; two acquire a session and fan out into OpenMP threads, one queues and times out into a 503](media/server.png)
+
+The walkthrough is in [server/README.md](server/README.md#request-lifecycle).
+
 One finding worth stating plainly: **concurrency does not increase throughput
 here.** Four simultaneous requests take the same total wall time as four
 sequential ones, because each one independently streams the whole weight set
@@ -133,6 +156,29 @@ engine change, not a serving change.
 Design notes and the phased plan:
 [docs/serving-implementation-plan.md](docs/serving-implementation-plan.md), and
 [docs/why-go.md](docs/why-go.md) for the language choice.
+
+### Running more than one
+
+Three deployment layers exist, each adding guarantees the previous one lacks.
+The thread budget multiplies across all of them: `replicas x workers x threads`
+must stay at or under the available cores.
+
+- **Docker Compose** ([compose.yaml](compose.yaml)) — two replicas on one host
+  behind an nginx gateway ([deploy/nginx.conf](deploy/nginx.conf)) that
+  balances with `least_conn` and disables proxy buffering so SSE streams
+  token by token. Replicas share one set of mmap'd model pages through the
+  page cache. No readiness gating, no rolling updates, no reconciliation.
+- **k3d / Kubernetes** ([deploy/k8s/](deploy/k8s/)) — a Deployment reconciles
+  the replica count and rolls updates without dipping below it; a Service
+  routes only to pods passing `/health/ready`, so a pod still loading the
+  model receives no traffic. NodePort rather than Ingress, because ingress
+  proxies buffer SSE.
+- **EKS** ([infra/](infra/), [deploy/k8s/eks/](deploy/k8s/eks/)) — Terraform
+  for the same manifests on AWS nodes; a bootstrap step places the model at
+  the `hostPath` every node mounts.
+
+The full tour, including what Compose cannot do and why that argues for
+Kubernetes, is in [server/README.md](server/README.md#infra-running-more-than-one-of-these).
 
 ## Tests
 
