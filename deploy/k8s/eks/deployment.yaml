@@ -54,7 +54,7 @@ spec:
 
       containers:
         - name: engine
-          image: 327319899002.dkr.ecr.ca-central-1.amazonaws.com/inference-engine:ee72f61-dirty-234221
+          image: 327319899002.dkr.ecr.ca-central-1.amazonaws.com/inference-engine:1dd1c9f
           imagePullPolicy: IfNotPresent
 
           # Flags append to the image ENTRYPOINT. queue-wait drops from its
