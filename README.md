@@ -22,6 +22,19 @@ The [optimization roadmap](docs/optimization-roadmap.md) ranks proposed changes
 from small math fixes through one-pass prefill, KV caching, CPU kernels, and a
 GPU backend, with expected benefits and validation requirements.
 
+## Architecture
+
+End to end: the C++ engine behind a stable C ABI, a Go server that pools
+sessions and streams tokens over it via cgo, and three deployment layers —
+Docker Compose, k3d, and AWS EKS — running copies of that server behind a
+load balancer.
+
+![Architecture diagram of the inference engine, Go server, and deployment layers](media/architect-diagram.png)
+
+## Demo
+
+<video src="media/demo.mp4" controls muted playsinline width="100%"></video>
+
 ## Inside the engine
 
 ### Grouped-query attention
