@@ -33,7 +33,9 @@ load balancer.
 
 ## Demo
 
-<video src="media/demo.mp4" controls muted playsinline width="100%"></video>
+https://github.com/user-attachments/assets/1fe1e499-072e-4164-90f5-79bd517159af
+
+The server is still serving the model concurrently despite a pod failing. Client retried and got the response back eventually when the pod healed.
 
 ## Inside the engine
 
