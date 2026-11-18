@@ -167,6 +167,7 @@ if(BUILD_TESTING)
     add_executable(gguf_f32_view_test
         tests/gguf_f32_view_test.cpp
         src/gguf_reader.cpp
+        src/quantization.cpp
     )
 
     target_include_directories(gguf_f32_view_test PRIVATE include src)
@@ -190,6 +191,7 @@ if(BUILD_TESTING)
     add_executable(gguf_float_metadata_test
         tests/gguf_float_metadata_test.cpp
         src/gguf_reader.cpp
+        src/quantization.cpp
     )
 
     target_include_directories(gguf_float_metadata_test PRIVATE include src)
@@ -289,6 +291,7 @@ if(BUILD_TESTING)
     add_executable(gguf_quantized_view_test
         tests/gguf_quantized_view_test.cpp
         src/gguf_reader.cpp
+        src/quantization.cpp
     )
 
     target_include_directories(gguf_quantized_view_test PRIVATE include src)
