@@ -49,4 +49,29 @@ int quantized_tensor_matmul_f32(
     int output_count
 );
 
+/*
+ * Fast variants that quantize the activation vector(s) to int8 once per call
+ * (one scale per 32 elements), then run integer block dots against the packed
+ * weights. Results differ from the f32 variants by the activation rounding
+ * error, which is the standard speed/accuracy trade of int8 inference.
+ * Shapes, validation, and failure behavior match the f32 variants. Falls back
+ * to the exact f32 path when temporary buffers cannot be allocated.
+ */
+int quantized_tensor_matvec_act_q8(
+    const GgufQuantizedTensorView *matrix,
+    const float *input,
+    int input_count,
+    float *output,
+    int output_count
+);
+
+int quantized_tensor_matmul_act_q8(
+    const GgufQuantizedTensorView *matrix,
+    const float *inputs,
+    int input_count,
+    int batch_count,
+    float *outputs,
+    int output_count
+);
+
 #endif

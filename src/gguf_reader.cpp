@@ -1,4 +1,5 @@
 #include "gguf_reader.h"
+#include "quantization.h"
 
 #include <limits.h>
 #include <stdio.h>
@@ -10,6 +11,13 @@
 #include <sys/mman.h>
 #include <sys/stat.h>
 #include <unistd.h>
+
+/* See GgufFile::q5_0_repacked in gguf_reader.h. */
+typedef struct Q5_0RepackEntry {
+    const char *name;        // owned by the matching GgufTensorInfo::name
+    Q8_0Block *blocks;        // malloc'd; block_count entries
+    uint64_t block_count;
+} Q5_0RepackEntry;
 
 #define GGUF_HEADER_SIZE 24
 #define GGUF_MAX_METADATA_ENTRIES 1000000

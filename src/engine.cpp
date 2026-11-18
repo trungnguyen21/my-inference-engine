@@ -9,6 +9,42 @@
 #include <stdlib.h>
 #include <string.h>
 
+#ifdef _OPENMP
+#include <omp.h>
+#endif
+#if defined(__APPLE__)
+/* <sys/sysctl.h> fails under this project's strict POSIX flags (u_int). */
+extern "C" int sysctlbyname(const char *, void *, size_t *, void *, size_t);
+#endif
+
+/* Token-by-token matvecs are memory-bound; oversubscribing them onto
+ * efficiency cores or SMT siblings makes every OpenMP barrier wait on the
+ * slowest thread. Prefer performance-core count; OMP_NUM_THREADS overrides. */
+static void engine_configure_threads(void)
+{
+#ifdef _OPENMP
+    static int configured = 0;
+    if (configured) return;
+    configured = 1;
+    if (getenv("OMP_NUM_THREADS") != nullptr) return;
+
+    int threads = 0;
+#if defined(__APPLE__)
+    int performance_cores = 0;
+    size_t size = sizeof(performance_cores);
+    if (sysctlbyname("hw.perflevel0.logicalcpu", &performance_cores,
+                     &size, nullptr, 0) == 0 && performance_cores > 0) {
+        threads = performance_cores;
+    }
+#endif
+    if (threads <= 0) {
+        threads = omp_get_num_procs() / 2;
+    }
+    if (threads < 1) threads = 1;
+    omp_set_num_threads(threads);
+#endif
+}
+
 static void set_error(char *error, int capacity, const char *message)
 {
     if (error != nullptr && capacity > 0) {
@@ -24,6 +60,8 @@ int engine_load_model(const char *model_path, Model *model,
     uint64_t architecture_identifier_length;
     uint32_t token_element_type;
     uint64_t token_count;
+
+    engine_configure_threads();
 
     if (model == nullptr) {
         set_error(error, error_capacity, "Model output pointer is null.");

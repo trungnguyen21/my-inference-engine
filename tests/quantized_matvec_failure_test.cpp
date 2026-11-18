@@ -37,6 +37,56 @@ int q6_k_dot_f32(const Q6_KBlock *block, const float *, float *result)
     return block_result(block->scale_f16_bits, result);
 }
 
+/* The act-q8 entry points link against these helpers too; stub them with the
+ * same failure marker so both paths propagate worker failures identically. */
+int quantize_activations_q8(const float *, int count,
+                            int8_t *values, float *scales, int32_t *sums)
+{
+    memset(values, 0, (size_t)count);
+    memset(scales, 0, (size_t)(count / ACTIVATION_Q8_GROUP) * sizeof(float));
+    memset(sums, 0, (size_t)(count / ACTIVATION_Q8_GROUP) * sizeof(int32_t));
+    return 1;
+}
+static int row_result(const unsigned char *row, uint64_t blocks,
+                      size_t block_bytes, size_t scale_offset, float *result)
+{
+    float sum = 0.0f;
+    for (uint64_t b = 0; b < blocks; ++b) {
+        uint16_t marker;
+        memcpy(&marker, row + b * block_bytes + scale_offset, sizeof(marker));
+        float value;
+        if (!block_result(marker, &value)) return 0;
+        sum += value;
+    }
+    *result = sum;
+    return 1;
+}
+int q5_0_row_dot_q8(const unsigned char *row, uint64_t blocks,
+                    const int8_t *, const float *, float *result)
+{
+    return row_result(row, blocks, Q5_0_BLOCK_BYTES,
+                      offsetof(Q5_0Block, scale_f16_bits), result);
+}
+int q8_0_row_dot_q8(const unsigned char *row, uint64_t blocks,
+                    const int8_t *, const float *, float *result)
+{
+    return row_result(row, blocks, Q8_0_BLOCK_BYTES,
+                      offsetof(Q8_0Block, scale_f16_bits), result);
+}
+int q4_k_row_dot_q8(const unsigned char *row, uint64_t blocks,
+                    const int8_t *, const float *, const int32_t *,
+                    float *result)
+{
+    return row_result(row, blocks, Q4_K_BLOCK_BYTES,
+                      offsetof(Q4_KBlock, scale_f16_bits), result);
+}
+int q6_k_row_dot_q8(const unsigned char *row, uint64_t blocks,
+                    const int8_t *, const float *, float *result)
+{
+    return row_result(row, blocks, Q6_K_BLOCK_BYTES,
+                      offsetof(Q6_KBlock, scale_f16_bits), result);
+}
+
 static void test_failures()
 {
     const struct {

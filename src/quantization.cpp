@@ -754,3 +754,522 @@ int q6_k_dot_f32(const Q6_KBlock *block, const float *input, float *result)
 #endif
     return 1;
 }
+
+/* ---- Integer-activation kernels -------------------------------------------
+ *
+ * The f32 kernels above widen every weight to float before multiplying. The
+ * kernels below instead take activations already quantized to int8 (one scale
+ * per 32 elements) so weight * activation products stay in integer registers.
+ * On ARM with the dot-product extension, SDOT performs sixteen int8
+ * multiply-accumulates per instruction. */
+
+int quantize_activations_q8(const float *input, int count,
+                            int8_t *values, float *scales, int32_t *sums)
+{
+    if (input == nullptr || values == nullptr || scales == nullptr ||
+        sums == nullptr || count <= 0 || count % ACTIVATION_Q8_GROUP != 0) {
+        return 0;
+    }
+    const int groups = count / ACTIVATION_Q8_GROUP;
+    for (int g = 0; g < groups; ++g) {
+        const float *x = input + g * ACTIVATION_Q8_GROUP;
+        float amax = 0.0f;
+        for (int i = 0; i < ACTIVATION_Q8_GROUP; ++i) {
+            float a = fabsf(x[i]);
+            if (a > amax) amax = a;
+        }
+        int8_t *q = values + g * ACTIVATION_Q8_GROUP;
+        if (amax == 0.0f) {
+            scales[g] = 0.0f;
+            sums[g] = 0;
+            memset(q, 0, ACTIVATION_Q8_GROUP);
+            continue;
+        }
+        const float inverse = 127.0f / amax;
+        scales[g] = amax / 127.0f;
+        int32_t sum = 0;
+        for (int i = 0; i < ACTIVATION_Q8_GROUP; ++i) {
+            int v = (int)lrintf(x[i] * inverse);
+            if (v > 127) v = 127;
+            if (v < -127) v = -127;
+            q[i] = (int8_t)v;
+            sum += v;
+        }
+        sums[g] = sum;
+    }
+    return 1;
+}
+
+#if defined(__aarch64__) && defined(__ARM_NEON) && defined(__ARM_FEATURE_DOTPROD)
+#define ENGINE_HAVE_SDOT 1
+
+static inline int32_t sdot_16(const int8x16_t weights, const int8x16_t activations)
+{
+    return vaddvq_s32(vdotq_s32(vdupq_n_s32(0), weights, activations));
+}
+#endif
+
+int q8_0_dot_q8(const Q8_0Block *block, const int8_t *q,
+                float activation_scale, float *result)
+{
+    if (block == nullptr || q == nullptr || result == nullptr) return 0;
+    float weight_scale = 0.0f;
+    f16_bits_to_f32(block->scale_f16_bits, &weight_scale);
+#if defined(ENGINE_HAVE_SDOT)
+    const int8x16_t w_lo = vld1q_s8(block->quantized_values);
+    const int8x16_t w_hi = vld1q_s8(block->quantized_values + 16);
+    int32x4_t acc = vdotq_s32(vdupq_n_s32(0), w_lo, vld1q_s8(q));
+    acc = vdotq_s32(acc, w_hi, vld1q_s8(q + 16));
+    *result = weight_scale * activation_scale * (float)vaddvq_s32(acc);
+#else
+    int32_t acc = 0;
+    for (int i = 0; i < Q8_0_BLOCK_ELEMENTS; ++i) {
+        acc += (int32_t)block->quantized_values[i] * q[i];
+    }
+    *result = weight_scale * activation_scale * (float)acc;
+#endif
+    return 1;
+}
+
+int q5_0_dot_q8(const Q5_0Block *block, const int8_t *q,
+                float activation_scale, float *result)
+{
+    if (block == nullptr || q == nullptr || result == nullptr) return 0;
+    float weight_scale = 0.0f;
+    f16_bits_to_f32(block->scale_f16_bits, &weight_scale);
+#if defined(ENGINE_HAVE_SDOT)
+    static const uint8_t bit_masks[16] = {1, 2, 4, 8, 16, 32, 64, 128,
+                                          1, 2, 4, 8, 16, 32, 64, 128};
+    const uint8x16_t masks = vld1q_u8(bit_masks);
+    const uint8x16_t fifth = vdupq_n_u8(16);
+    const int8x16_t center = vdupq_n_s8(16);
+
+    const uint8x16_t packed = vld1q_u8(block->packed_nibbles);
+    const uint8x16_t low_nibbles = vandq_u8(packed, vdupq_n_u8(15));
+    const uint8x16_t high_nibbles = vshrq_n_u8(packed, 4);
+
+    const uint8x16_t low_bits_bytes = vcombine_u8(
+        vdup_n_u8(block->high_bits[0]), vdup_n_u8(block->high_bits[1]));
+    const uint8x16_t high_bits_bytes = vcombine_u8(
+        vdup_n_u8(block->high_bits[2]), vdup_n_u8(block->high_bits[3]));
+    const uint8x16_t low_fifth = vandq_u8(vtstq_u8(low_bits_bytes, masks), fifth);
+    const uint8x16_t high_fifth = vandq_u8(vtstq_u8(high_bits_bytes, masks), fifth);
+
+    const int8x16_t w_lo = vsubq_s8(
+        vreinterpretq_s8_u8(vorrq_u8(low_nibbles, low_fifth)), center);
+    const int8x16_t w_hi = vsubq_s8(
+        vreinterpretq_s8_u8(vorrq_u8(high_nibbles, high_fifth)), center);
+
+    int32x4_t acc = vdotq_s32(vdupq_n_s32(0), w_lo, vld1q_s8(q));
+    acc = vdotq_s32(acc, w_hi, vld1q_s8(q + 16));
+    *result = weight_scale * activation_scale * (float)vaddvq_s32(acc);
+#else
+    int32_t acc = 0;
+    for (int i = 0; i < Q5_0_BLOCK_ELEMENTS; ++i) {
+        uint8_t packed = block->packed_nibbles[i % 16];
+        uint8_t low = (i <= 15) ? (packed & 0x0f) : ((packed >> 4) & 0x0f);
+        int fifth_bit = (block->high_bits[i / 8] >> (i % 8)) & 1;
+        int weight = (low | (fifth_bit << 4)) - 16;
+        acc += weight * q[i];
+    }
+    *result = weight_scale * activation_scale * (float)acc;
+#endif
+    return 1;
+}
+
+int q4_k_dot_q8(const Q4_KBlock *block, const int8_t *q,
+                const float *activation_scales,
+                const int32_t *activation_sums, float *result)
+{
+    if (block == nullptr || q == nullptr || activation_scales == nullptr ||
+        activation_sums == nullptr || result == nullptr) {
+        return 0;
+    }
+    float shared_scale = 0.0f;
+    float shared_min = 0.0f;
+    f16_bits_to_f32(block->scale_f16_bits, &shared_scale);
+    f16_bits_to_f32(block->min_f16_bits, &shared_min);
+
+    float sum = 0.0f;
+    for (int group = 0; group < 4; ++group) {
+        const uint8_t *packed = block->packed_nibbles + 32 * group;
+        for (int half = 0; half < 2; ++half) {
+            const int subblock = 2 * group + half;
+            uint8_t scale_multiplier = 0;
+            uint8_t min_multiplier = 0;
+            q4_k_unpack_scale_min(block->scale_and_min, subblock,
+                                  &scale_multiplier, &min_multiplier);
+            const int8_t *activations = q + 64 * group + 32 * half;
+            int32_t dot;
+#if defined(ENGINE_HAVE_SDOT)
+            const uint8x16_t bytes_lo = vld1q_u8(packed);
+            const uint8x16_t bytes_hi = vld1q_u8(packed + 16);
+            int8x16_t w_lo;
+            int8x16_t w_hi;
+            if (half == 0) {
+                w_lo = vreinterpretq_s8_u8(vandq_u8(bytes_lo, vdupq_n_u8(15)));
+                w_hi = vreinterpretq_s8_u8(vandq_u8(bytes_hi, vdupq_n_u8(15)));
+            } else {
+                w_lo = vreinterpretq_s8_u8(vshrq_n_u8(bytes_lo, 4));
+                w_hi = vreinterpretq_s8_u8(vshrq_n_u8(bytes_hi, 4));
+            }
+            int32x4_t acc = vdotq_s32(vdupq_n_s32(0), w_lo, vld1q_s8(activations));
+            acc = vdotq_s32(acc, w_hi, vld1q_s8(activations + 16));
+            dot = vaddvq_s32(acc);
+#else
+            dot = 0;
+            for (int i = 0; i < 32; ++i) {
+                int nibble = half == 0 ? (packed[i] & 0x0f) : (packed[i] >> 4);
+                dot += nibble * activations[i];
+            }
+#endif
+            const int scale_group = 2 * group + half;
+            sum += activation_scales[scale_group] *
+                   (shared_scale * scale_multiplier * (float)dot -
+                    shared_min * min_multiplier *
+                        (float)activation_sums[scale_group]);
+        }
+    }
+    *result = sum;
+    return 1;
+}
+
+int q6_k_dot_q8(const Q6_KBlock *block, const int8_t *q,
+                const float *activation_scales, float *result)
+{
+    if (block == nullptr || q == nullptr || activation_scales == nullptr ||
+        result == nullptr) {
+        return 0;
+    }
+    float shared_scale = 0.0f;
+    f16_bits_to_f32(block->scale_f16_bits, &shared_scale);
+
+    float sum = 0.0f;
+    for (int group = 0; group < 2; ++group) {
+        for (int region = 0; region < 4; ++region) {
+            const int lower_base = group * 64 + (region & 1) * 32;
+            const int upper_shift = region * 2;
+            const int low_shift = (region >> 1) * 4;
+            const int scale_base = group * 8 + region * 2;
+            const int element_base = group * 128 + region * 32;
+            const int8_t *activations = q + element_base;
+            int32_t dot_first_16;
+            int32_t dot_second_16;
+#if defined(ENGINE_HAVE_SDOT)
+            const uint8x16_t lower_a = vld1q_u8(block->lower_bits + lower_base);
+            const uint8x16_t lower_b = vld1q_u8(block->lower_bits + lower_base + 16);
+            const uint8x16_t upper_a = vld1q_u8(block->upper_bits + group * 32);
+            const uint8x16_t upper_b = vld1q_u8(block->upper_bits + group * 32 + 16);
+            const uint8x16_t nibble_mask = vdupq_n_u8(15);
+            const uint8x16_t two_bit_mask = vdupq_n_u8(3);
+            const int8x16_t center = vdupq_n_s8(32);
+
+            uint8x16_t low_a;
+            uint8x16_t low_b;
+            if (low_shift == 0) {
+                low_a = vandq_u8(lower_a, nibble_mask);
+                low_b = vandq_u8(lower_b, nibble_mask);
+            } else {
+                low_a = vshrq_n_u8(lower_a, 4);
+                low_b = vshrq_n_u8(lower_b, 4);
+            }
+            uint8x16_t up_a;
+            uint8x16_t up_b;
+            switch (upper_shift) {
+                case 0:
+                    up_a = vandq_u8(upper_a, two_bit_mask);
+                    up_b = vandq_u8(upper_b, two_bit_mask);
+                    break;
+                case 2:
+                    up_a = vandq_u8(vshrq_n_u8(upper_a, 2), two_bit_mask);
+                    up_b = vandq_u8(vshrq_n_u8(upper_b, 2), two_bit_mask);
+                    break;
+                case 4:
+                    up_a = vandq_u8(vshrq_n_u8(upper_a, 4), two_bit_mask);
+                    up_b = vandq_u8(vshrq_n_u8(upper_b, 4), two_bit_mask);
+                    break;
+                default:
+                    up_a = vshrq_n_u8(upper_a, 6);
+                    up_b = vshrq_n_u8(upper_b, 6);
+                    break;
+            }
+            const int8x16_t w_a = vsubq_s8(
+                vreinterpretq_s8_u8(vorrq_u8(low_a, vshlq_n_u8(up_a, 4))), center);
+            const int8x16_t w_b = vsubq_s8(
+                vreinterpretq_s8_u8(vorrq_u8(low_b, vshlq_n_u8(up_b, 4))), center);
+            dot_first_16 = sdot_16(w_a, vld1q_s8(activations));
+            dot_second_16 = sdot_16(w_b, vld1q_s8(activations + 16));
+#else
+            dot_first_16 = 0;
+            dot_second_16 = 0;
+            for (int offset = 0; offset < 32; ++offset) {
+                const int low = (block->lower_bits[lower_base + offset] >> low_shift) & 0x0f;
+                const int high = (block->upper_bits[group * 32 + offset] >> upper_shift) & 0x03;
+                const int weight = (low | (high << 4)) - 32;
+                if (offset < 16) dot_first_16 += weight * activations[offset];
+                else dot_second_16 += weight * activations[offset];
+            }
+#endif
+            sum += activation_scales[element_base / 32] * shared_scale *
+                   ((float)block->scales[scale_base] * (float)dot_first_16 +
+                    (float)block->scales[scale_base + 1] * (float)dot_second_16);
+        }
+    }
+    *result = sum;
+    return 1;
+}
+
+/* ---- Row-level integer kernels --------------------------------------------
+ *
+ * The per-block entry points above pay a function call, argument checks, and
+ * a block copy for every 32 weights. These walk one packed row directly;
+ * AArch64 NEON loads tolerate the unaligned 22/34/144/210-byte strides, and
+ * scalar fields are read with memcpy. */
+
+static inline float f16_to_f32_fast(const unsigned char *bytes)
+{
+    uint16_t bits;
+    memcpy(&bits, bytes, sizeof(bits));
+    float value;
+    f16_bits_to_f32(bits, &value);
+    return value;
+}
+
+int q8_0_row_dot_q8(const unsigned char *row, uint64_t blocks,
+                    const int8_t *q, const float *scales, float *result)
+{
+    if (row == nullptr || q == nullptr || scales == nullptr ||
+        result == nullptr) return 0;
+    float acc = 0.0f;
+    for (uint64_t b = 0; b < blocks; ++b) {
+        const float weight_scale = f16_to_f32_fast(row);
+        const int8_t *w = (const int8_t *)(row + 2);
+#if defined(ENGINE_HAVE_SDOT)
+        int8x16_t w_lo, w_hi;
+        memcpy(&w_lo, w, 16);
+        memcpy(&w_hi, w + 16, 16);
+        int32x4_t dot = vdotq_s32(vdupq_n_s32(0), w_lo, vld1q_s8(q));
+        dot = vdotq_s32(dot, w_hi, vld1q_s8(q + 16));
+        acc += weight_scale * scales[b] * (float)vaddvq_s32(dot);
+#else
+        int32_t dot = 0;
+        for (int i = 0; i < Q8_0_BLOCK_ELEMENTS; ++i) dot += (int32_t)w[i] * q[i];
+        acc += weight_scale * scales[b] * (float)dot;
+#endif
+        row += Q8_0_BLOCK_BYTES;
+        q += Q8_0_BLOCK_ELEMENTS;
+    }
+    *result = acc;
+    return 1;
+}
+
+int q5_0_row_dot_q8(const unsigned char *row, uint64_t blocks,
+                    const int8_t *q, const float *scales, float *result)
+{
+    if (row == nullptr || q == nullptr || scales == nullptr ||
+        result == nullptr) return 0;
+    float acc = 0.0f;
+#if defined(ENGINE_HAVE_SDOT)
+    static const uint8_t bit_masks[16] = {1, 2, 4, 8, 16, 32, 64, 128,
+                                          1, 2, 4, 8, 16, 32, 64, 128};
+    const uint8x16_t masks = vld1q_u8(bit_masks);
+    const uint8x16_t fifth = vdupq_n_u8(16);
+    const int8x16_t center = vdupq_n_s8(16);
+    const uint8x16_t nibble_mask = vdupq_n_u8(15);
+#endif
+    for (uint64_t b = 0; b < blocks; ++b) {
+        const float weight_scale = f16_to_f32_fast(row);
+#if defined(ENGINE_HAVE_SDOT)
+        uint8x16_t packed;
+        memcpy(&packed, row + 6, 16);
+        const uint8x16_t low_nibbles = vandq_u8(packed, nibble_mask);
+        const uint8x16_t high_nibbles = vshrq_n_u8(packed, 4);
+        const uint8x16_t low_bits_bytes = vcombine_u8(
+            vdup_n_u8(row[2]), vdup_n_u8(row[3]));
+        const uint8x16_t high_bits_bytes = vcombine_u8(
+            vdup_n_u8(row[4]), vdup_n_u8(row[5]));
+        const int8x16_t w_lo = vsubq_s8(vreinterpretq_s8_u8(vorrq_u8(
+            low_nibbles, vandq_u8(vtstq_u8(low_bits_bytes, masks), fifth))), center);
+        const int8x16_t w_hi = vsubq_s8(vreinterpretq_s8_u8(vorrq_u8(
+            high_nibbles, vandq_u8(vtstq_u8(high_bits_bytes, masks), fifth))), center);
+        int32x4_t dot = vdotq_s32(vdupq_n_s32(0), w_lo, vld1q_s8(q));
+        dot = vdotq_s32(dot, w_hi, vld1q_s8(q + 16));
+        acc += weight_scale * scales[b] * (float)vaddvq_s32(dot);
+#else
+        int32_t dot = 0;
+        for (int i = 0; i < Q5_0_BLOCK_ELEMENTS; ++i) {
+            uint8_t packed = row[6 + (i % 16)];
+            uint8_t low = (i <= 15) ? (packed & 0x0f) : ((packed >> 4) & 0x0f);
+            int fifth_bit = (row[2 + i / 8] >> (i % 8)) & 1;
+            dot += ((low | (fifth_bit << 4)) - 16) * q[i];
+        }
+        acc += weight_scale * scales[b] * (float)dot;
+#endif
+        row += Q5_0_BLOCK_BYTES;
+        q += Q5_0_BLOCK_ELEMENTS;
+    }
+    *result = acc;
+    return 1;
+}
+
+int q4_k_row_dot_q8(const unsigned char *row, uint64_t blocks,
+                    const int8_t *q, const float *scales,
+                    const int32_t *sums, float *result)
+{
+    if (row == nullptr || q == nullptr || scales == nullptr ||
+        sums == nullptr || result == nullptr) return 0;
+    float acc = 0.0f;
+    for (uint64_t b = 0; b < blocks; ++b) {
+        const float shared_scale = f16_to_f32_fast(row);
+        const float shared_min = f16_to_f32_fast(row + 2);
+        const uint8_t *scale_and_min = row + 4;
+        const uint8_t *nibbles = row + 4 + Q4_K_SCALE_AND_MIN_BYTES;
+        for (int group = 0; group < 4; ++group) {
+            const uint8_t *packed = nibbles + 32 * group;
+            for (int half = 0; half < 2; ++half) {
+                const int subblock = 2 * group + half;
+                uint8_t scale_multiplier = 0;
+                uint8_t min_multiplier = 0;
+                q4_k_unpack_scale_min(scale_and_min, subblock,
+                                      &scale_multiplier, &min_multiplier);
+                const int8_t *activations = q + 64 * group + 32 * half;
+                int32_t dot;
+#if defined(ENGINE_HAVE_SDOT)
+                uint8x16_t bytes_lo, bytes_hi;
+                memcpy(&bytes_lo, packed, 16);
+                memcpy(&bytes_hi, packed + 16, 16);
+                int8x16_t w_lo, w_hi;
+                if (half == 0) {
+                    w_lo = vreinterpretq_s8_u8(vandq_u8(bytes_lo, vdupq_n_u8(15)));
+                    w_hi = vreinterpretq_s8_u8(vandq_u8(bytes_hi, vdupq_n_u8(15)));
+                } else {
+                    w_lo = vreinterpretq_s8_u8(vshrq_n_u8(bytes_lo, 4));
+                    w_hi = vreinterpretq_s8_u8(vshrq_n_u8(bytes_hi, 4));
+                }
+                int32x4_t vdot = vdotq_s32(vdupq_n_s32(0), w_lo, vld1q_s8(activations));
+                vdot = vdotq_s32(vdot, w_hi, vld1q_s8(activations + 16));
+                dot = vaddvq_s32(vdot);
+#else
+                dot = 0;
+                for (int i = 0; i < 32; ++i) {
+                    int nibble = half == 0 ? (packed[i] & 0x0f) : (packed[i] >> 4);
+                    dot += nibble * activations[i];
+                }
+#endif
+                const int subblock_index = 2 * group + half;
+                acc += scales[subblock_index] *
+                       (shared_scale * scale_multiplier * (float)dot -
+                        shared_min * min_multiplier * (float)sums[subblock_index]);
+            }
+        }
+        row += Q4_K_BLOCK_BYTES;
+        q += Q4_K_BLOCK_ELEMENTS;
+        scales += Q4_K_BLOCK_ELEMENTS / ACTIVATION_Q8_GROUP;
+        sums += Q4_K_BLOCK_ELEMENTS / ACTIVATION_Q8_GROUP;
+    }
+    *result = acc;
+    return 1;
+}
+
+int q6_k_row_dot_q8(const unsigned char *row, uint64_t blocks,
+                    const int8_t *q, const float *scales, float *result)
+{
+    if (row == nullptr || q == nullptr || scales == nullptr ||
+        result == nullptr) return 0;
+    float acc = 0.0f;
+    for (uint64_t b = 0; b < blocks; ++b) {
+        const uint8_t *lower_bits = row;
+        const uint8_t *upper_bits = row + Q6_K_LOWER_BITS_BYTES;
+        const int8_t *scale_values =
+            (const int8_t *)(row + Q6_K_LOWER_BITS_BYTES + Q6_K_UPPER_BITS_BYTES);
+        const float shared_scale =
+            f16_to_f32_fast(row + Q6_K_LOWER_BITS_BYTES + Q6_K_UPPER_BITS_BYTES +
+                            Q6_K_SCALE_COUNT);
+        for (int group = 0; group < 2; ++group) {
+            for (int region = 0; region < 4; ++region) {
+                const int lower_base = group * 64 + (region & 1) * 32;
+                const int upper_shift = region * 2;
+                const int low_shift = (region >> 1) * 4;
+                const int scale_base = group * 8 + region * 2;
+                const int element_base = group * 128 + region * 32;
+                const int8_t *activations = q + element_base;
+                int32_t dot_first_16;
+                int32_t dot_second_16;
+#if defined(ENGINE_HAVE_SDOT)
+                uint8x16_t lower_a, lower_b, upper_a, upper_b;
+                memcpy(&lower_a, lower_bits + lower_base, 16);
+                memcpy(&lower_b, lower_bits + lower_base + 16, 16);
+                memcpy(&upper_a, upper_bits + group * 32, 16);
+                memcpy(&upper_b, upper_bits + group * 32 + 16, 16);
+                const uint8x16_t nibble_mask = vdupq_n_u8(15);
+                const uint8x16_t two_bit_mask = vdupq_n_u8(3);
+                const int8x16_t center = vdupq_n_s8(32);
+                uint8x16_t low_a, low_b;
+                if (low_shift == 0) {
+                    low_a = vandq_u8(lower_a, nibble_mask);
+                    low_b = vandq_u8(lower_b, nibble_mask);
+                } else {
+                    low_a = vshrq_n_u8(lower_a, 4);
+                    low_b = vshrq_n_u8(lower_b, 4);
+                }
+                uint8x16_t up_a, up_b;
+                switch (upper_shift) {
+                    case 0:
+                        up_a = vandq_u8(upper_a, two_bit_mask);
+                        up_b = vandq_u8(upper_b, two_bit_mask);
+                        break;
+                    case 2:
+                        up_a = vandq_u8(vshrq_n_u8(upper_a, 2), two_bit_mask);
+                        up_b = vandq_u8(vshrq_n_u8(upper_b, 2), two_bit_mask);
+                        break;
+                    case 4:
+                        up_a = vandq_u8(vshrq_n_u8(upper_a, 4), two_bit_mask);
+                        up_b = vandq_u8(vshrq_n_u8(upper_b, 4), two_bit_mask);
+                        break;
+                    default:
+                        up_a = vshrq_n_u8(upper_a, 6);
+                        up_b = vshrq_n_u8(upper_b, 6);
+                        break;
+                }
+                const int8x16_t w_a = vsubq_s8(vreinterpretq_s8_u8(
+                    vorrq_u8(low_a, vshlq_n_u8(up_a, 4))), center);
+                const int8x16_t w_b = vsubq_s8(vreinterpretq_s8_u8(
+                    vorrq_u8(low_b, vshlq_n_u8(up_b, 4))), center);
+                dot_first_16 = sdot_16(w_a, vld1q_s8(activations));
+                dot_second_16 = sdot_16(w_b, vld1q_s8(activations + 16));
+#else
+                dot_first_16 = 0;
+                dot_second_16 = 0;
+                for (int offset = 0; offset < 32; ++offset) {
+                    const int low = (lower_bits[lower_base + offset] >> low_shift) & 0x0f;
+                    const int high = (upper_bits[group * 32 + offset] >> upper_shift) & 0x03;
+                    const int weight = (low | (high << 4)) - 32;
+                    if (offset < 16) dot_first_16 += weight * activations[offset];
+                    else dot_second_16 += weight * activations[offset];
+                }
+#endif
+                acc += scales[element_base / 32] * shared_scale *
+                       ((float)scale_values[scale_base] * (float)dot_first_16 +
+                        (float)scale_values[scale_base + 1] * (float)dot_second_16);
+            }
+        }
+        row += Q6_K_BLOCK_BYTES;
+        q += Q6_K_BLOCK_ELEMENTS;
+        scales += Q6_K_BLOCK_ELEMENTS / ACTIVATION_Q8_GROUP;
+    }
+    *result = acc;
+    return 1;
+}
+
+int q5_0_repack_to_q8_0(const Q5_0Block *src, Q8_0Block *dst)
+{
+    if (src == nullptr || dst == nullptr) return 0;
+    dst->scale_f16_bits = src->scale_f16_bits;
+    for (int i = 0; i < Q5_0_BLOCK_ELEMENTS; ++i) {
+        uint8_t packed = src->packed_nibbles[i % 16];
+        uint8_t low = (i <= 15) ? (packed & 0x0f) : ((packed >> 4) & 0x0f);
+        int fifth_bit = (src->high_bits[i / 8] >> (i % 8)) & 1;
+        dst->quantized_values[i] = (int8_t)((low | (fifth_bit << 4)) - 16);
+    }
+    return 1;
+}

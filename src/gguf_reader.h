@@ -58,6 +58,15 @@ typedef struct GgufFile {
     uint32_t alignment;
     GgufMetadataEntry *metadata;
     GgufTensorInfo *tensors;
+
+    /* Q5_0 weights store a fifth bit in a separate bitfield, which costs a
+     * multi-instruction unpack before every dot product. Since a Q5_0 value
+     * already fits losslessly in int8, gguf_open() precomputes a Q8_0-layout
+     * copy of every Q5_0 tensor (opaque here; see Q5_0RepackEntry in
+     * gguf_reader.cpp). gguf_get_quantized_tensor_view() hands back the
+     * repacked copy transparently, so callers never see ggml_type Q5_0. */
+    void *q5_0_repacked;
+    uint64_t q5_0_repacked_count;
 } GgufFile;
 
 /* A sequential view of one GGUF array. Values point into GgufFile::data. */
