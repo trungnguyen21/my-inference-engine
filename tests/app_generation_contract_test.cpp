@@ -151,6 +151,19 @@ int engine_prefill_tokens(const Model *model, InferenceState *state,
     return 1;
 }
 
+int sampler_apply_repetition_penalty(float *, int, const unsigned char *, float)
+{
+    /* Every fixture disables the penalty; this fixture should never see it called. */
+    assert(false);
+    return 0;
+}
+
+void sampler_seed_rng(unsigned long)
+{
+    /* Every fixture uses temperature 0, so app_run should never seed the RNG. */
+    assert(false);
+}
+
 int sampler_sample(const float *scores, int count, float temperature, float top_p,
                    int *id, char *error, int capacity)
 {
@@ -215,6 +228,7 @@ static AppConfig config_for(int max_tokens)
     app_config_init(&config);
     strcpy(config.model_path, "fixture.gguf"); strcpy(config.prompt, "Hi");
     config.max_tokens = max_tokens; config.temperature = 0; config.top_p = 1;
+    config.repeat_penalty = 1.0f; /* disabled: this fixture tests control flow, not sampling */
     return config;
 }
 

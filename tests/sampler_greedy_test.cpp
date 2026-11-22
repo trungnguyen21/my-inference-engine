@@ -39,14 +39,54 @@ static void test_wrapper_validation()
     assert(!sampler_sample(logits, 0, 0, 1, &id, error, sizeof(error)) && id == -1);
     assert(!sampler_sample(logits, -1, 0, 1, &id, nullptr, 0) && id == -1);
     assert(!sampler_sample(logits, 2, 0, 1, nullptr, error, sizeof(error)));
-    /* Positive-temperature sampling is explicitly deferred. */
-    assert(!sampler_sample(logits, 2, 0.8f, 0.95f, &id, error, sizeof(error)));
-    assert(id == -1 && strstr(error, "--temperature 0"));
+
+    /* A non-finite logit must be rejected even at nonzero temperature. */
+    const float with_nan[] = {1.0f, NAN};
+    error[0] = '\0'; id = 123;
+    assert(!sampler_sample(with_nan, 2, 0.8f, 0.95f, &id, error, sizeof(error)));
+    assert(id == -1 && error[0]);
+}
+
+/* top_p == 0 keeps only the top-probability token in the nucleus, so the
+ * draw is deterministic regardless of the RNG seed. */
+static void test_nucleus_collapses_to_argmax()
+{
+    const float logits[] = {-3.0f, 0.5f, 7.0f, 2.0f};
+    char error[128];
+    for (unsigned long seed : {1ul, 2ul, 3ul}) {
+        sampler_seed_rng(seed);
+        for (int trial = 0; trial < 5; ++trial) {
+            int id = -1;
+            assert(sampler_sample(logits, 4, 0.7f, 0.0f, &id, error, sizeof(error)));
+            assert(id == 2);
+        }
+    }
+}
+
+/* With a fixed seed, nonzero-temperature sampling must be reproducible. */
+static void test_sampling_is_reproducible_with_seed()
+{
+    const float logits[] = {1.0f, 2.0f, 3.0f, 2.5f, 0.5f};
+    char error[128];
+    int first_run[20];
+    sampler_seed_rng(42);
+    for (int i = 0; i < 20; ++i) {
+        assert(sampler_sample(logits, 5, 0.8f, 0.9f, &first_run[i], error, sizeof(error)));
+        assert(first_run[i] >= 0 && first_run[i] < 5);
+    }
+    sampler_seed_rng(42);
+    for (int i = 0; i < 20; ++i) {
+        int id = -1;
+        assert(sampler_sample(logits, 5, 0.8f, 0.9f, &id, error, sizeof(error)));
+        assert(id == first_run[i]);
+    }
 }
 
 int main(int argc, char **argv)
 {
     test_wrapper_validation();
+    test_nucleus_collapses_to_argmax();
+    test_sampling_is_reproducible_with_seed();
     if (argc == 2 && strcmp(argv[1], "validation") == 0) return 0;
 
     const float ordinary[] = {-3.0f, 0.5f, 7.0f, 2.0f};

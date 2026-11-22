@@ -141,12 +141,22 @@ void inference_state_reset(InferenceState *state);
 /*
  * Select one token from the latest logits. Temperature zero uses greedy
  * selection (lowest ID on ties); top_p is ignored on this path after checking
- * its [0, 1] range. Nonzero temperature sampling is a later exercise.
+ * its [0, 1] range. Nonzero temperature applies temperature-scaled softmax,
+ * keeps the smallest highest-probability prefix whose cumulative mass
+ * reaches top_p (nucleus sampling), and draws from that nucleus using the
+ * RNG seeded by sampler_seed_rng.
  * Return 1 with a valid ID, or 0 with *token_id == -1 when writable and an error.
  * Logits must all be finite; temperature and top_p must be finite in [0, 1].
  */
 int sampler_sample(const float *logits, int vocab_size,
                    float temperature, float top_p, int *token_id,
                    char *error, int error_capacity);
+
+/*
+ * Seed the RNG used by nonzero-temperature sampling. Call once before the
+ * first such sampler_sample call; otherwise a random, non-reproducible seed
+ * is used. Not thread-safe.
+ */
+void sampler_seed_rng(unsigned long seed);
 
 #endif

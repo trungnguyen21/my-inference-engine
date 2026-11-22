@@ -4,6 +4,7 @@
 #include "generate.h"
 #include "metrics.h"
 #include "terminal.h"
+#include "sampler.h"
 
 #include <errno.h>
 #include <math.h>
@@ -48,12 +49,39 @@ static int parse_unit_float(const char *text, float *value)
     return 1;
 }
 
+static int parse_seed(const char *text, unsigned long *value)
+{
+    char *end = NULL;
+    errno = 0;
+    unsigned long parsed = strtoul(text, &end, 10);
+    if (errno != 0 || end == text || *end != '\0') {
+        return 0;
+    }
+    *value = parsed;
+    return 1;
+}
+
+static int parse_repeat_penalty(const char *text, float *value)
+{
+    char *end = NULL;
+    errno = 0;
+    float parsed = strtof(text, &end);
+    /* 1.0 disables the penalty; values much above 2.0 degrade quality. */
+    if (errno != 0 || end == text || *end != '\0' || !isfinite(parsed) ||
+        parsed < 1.0f || parsed > 2.0f) {
+        return 0;
+    }
+    *value = parsed;
+    return 1;
+}
+
 void app_config_init(AppConfig *config)
 {
     memset(config, 0, sizeof(*config));
     config->max_tokens = 128;
     config->temperature = 0.8f;
     config->top_p = 0.95f;
+    config->repeat_penalty = 1.1f;
 }
 
 void app_print_usage(const char *program_name)
@@ -64,6 +92,8 @@ void app_print_usage(const char *program_name)
             "  --max-tokens N   Maximum generated tokens (default: 128)\n"
             "  --temperature X  Sampling temperature in [0, 1] (default: 0.8)\n"
             "  --top-p X        Nucleus sampling threshold in [0, 1] (default: 0.95)\n"
+            "  --repeat-penalty X  Penalty for already-seen tokens in [1, 2] (default: 1.1, 1 disables)\n"
+            "  --seed N         RNG seed for temperature > 0 (default: random each run)\n"
             "  --profile        Collect and display operation timings (prefill + decode)\n"
             "  --help           Show this help\n",
             program_name);
@@ -122,6 +152,17 @@ int app_parse_args(int argc, char **argv, AppConfig *config)
                 fprintf(stderr, "Invalid --top-p value (expected 0 to 1): %s\n", value);
                 return -1;
             }
+        } else if (strcmp(option, "--repeat-penalty") == 0) {
+            if (!parse_repeat_penalty(value, &config->repeat_penalty)) {
+                fprintf(stderr, "Invalid --repeat-penalty value (expected 1 to 2): %s\n", value);
+                return -1;
+            }
+        } else if (strcmp(option, "--seed") == 0) {
+            if (!parse_seed(value, &config->seed)) {
+                fprintf(stderr, "Invalid --seed value: %s\n", value);
+                return -1;
+            }
+            config->has_seed = 1;
         } else {
             fprintf(stderr, "Unknown option: %s\n", option);
             app_print_usage(argv[0]);
@@ -207,8 +248,13 @@ int app_run(const AppConfig *config)
 
     state.profile.enabled = config->profile;
 
+    if (config->has_seed) {
+        sampler_seed_rng(config->seed);
+    }
+
     if (!generate_run(&model, &state, prompt_token_ids, prompt_token_count,
                       config->max_tokens, config->temperature, config->top_p,
+                      config->repeat_penalty,
                       &prompt_start_usage, app_emit_token, NULL,
                       &result, error, sizeof(error))) {
         terminal_print_error(error);

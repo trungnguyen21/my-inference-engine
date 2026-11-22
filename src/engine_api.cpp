@@ -25,6 +25,8 @@ struct EngineSession {
 
 /* Greedy decoding ignores nucleus sampling; pass the no-op value through. */
 #define GREEDY_TOP_P 1.0f
+/* This public API doesn't expose a repetition penalty yet. */
+#define NO_REPEAT_PENALTY 1.0f
 
 static void set_error(char *error, int capacity, const char *message)
 {
@@ -241,7 +243,8 @@ int engine_run(EngineSession *session, const char *prompt, int max_tokens,
 
     if (!generate_run(&session->handle->model, &session->state,
                       session->prompt_token_ids, prompt_token_count,
-                      max_tokens, temperature, GREEDY_TOP_P, &prompt_start_usage,
+                      max_tokens, temperature, GREEDY_TOP_P, NO_REPEAT_PENALTY,
+                      &prompt_start_usage,
                       on_token, user, &result, error, error_capacity)) {
         return 0;
     }

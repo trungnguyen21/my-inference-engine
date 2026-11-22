@@ -1,9 +1,11 @@
 #include "generate.h"
 
 #include "operation_timer.h"
+#include "sampler.h"
 
 #include <stdio.h>
 #include <string.h>
+#include <vector>
 
 static void set_error(char *error, int capacity, const char *message)
 {
@@ -48,6 +50,7 @@ int generate_prepare_prompt(const Model *model, const char *user_prompt,
 int generate_run(const Model *model, InferenceState *state,
                  const int *token_ids, int token_count,
                  int max_tokens, float temperature, float top_p,
+                 float repeat_penalty,
                  const UsageSnapshot *prompt_start_usage,
                  GenerateTokenFn on_token, void *user,
                  GenerateResult *result, char *error, int error_capacity)
@@ -73,6 +76,17 @@ int generate_run(const Model *model, InferenceState *state,
         return 0;
     }
 
+    int penalty_active = repeat_penalty > 1.0f && model->config.vocab_size > 0;
+    std::vector<unsigned char> seen;
+    if (penalty_active) {
+        seen.assign((size_t)model->config.vocab_size, 0);
+        for (int i = 0; i < token_count; ++i) {
+            if (token_ids[i] >= 0 && token_ids[i] < model->config.vocab_size) {
+                seen[(size_t)token_ids[i]] = 1;
+            }
+        }
+    }
+
     metrics_capture(&result->start_usage);
     while (generated_tokens < max_tokens) {
         int token_id = -1;
@@ -89,6 +103,12 @@ int generate_run(const Model *model, InferenceState *state,
         }
         {
             OperationTimer timer(state->profile.enabled, &state->profile.sampling_seconds);
+            if (penalty_active &&
+                !sampler_apply_repetition_penalty(state->logits, state->logits_count,
+                                                  seen.data(), repeat_penalty)) {
+                set_error(error, error_capacity, "Repetition penalty application failed.");
+                return 0;
+            }
             sample_result = sampler_sample(state->logits, state->logits_count,
                                            temperature, top_p, &token_id,
                                            error, error_capacity);
@@ -100,6 +120,9 @@ int generate_run(const Model *model, InferenceState *state,
             set_error(error, error_capacity,
                       "Sampler returned a token ID outside the vocabulary.");
             return 0;
+        }
+        if (penalty_active) {
+            seen[(size_t)token_id] = 1;
         }
         if (state->profile.enabled) ++state->profile.sampling_calls;
         ++generated_tokens;
