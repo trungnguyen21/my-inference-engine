@@ -129,6 +129,18 @@ int q5_0_dequantize_block(const Q5_0Block *block, float *output);
 int q5_0_dot_f32(const Q5_0Block *block, const float *input, float *result);
 
 /*
+ * Losslessly repack one Q5_0 block into the Q8_0 layout.
+ *
+ * A Q5_0 value is a signed 5-bit integer (-16..15), which always fits in an
+ * int8 with no rounding. src is one 22-byte Q5_0 block; dst receives the same
+ * scale and the same 32 integers, stored as plain int8 instead of packed
+ * nibbles plus a separate fifth-bit field. This lets a Q5_0 tensor reuse the
+ * faster, already-aligned Q8_0 dot-product kernels after a one-time,
+ * model-load repack. Return 0 when src or dst is null; otherwise return 1.
+ */
+int q5_0_repack_to_q8_0(const Q5_0Block *src, Q8_0Block *dst);
+
+/*
  * This matches one GGML Q4_K block in a GGUF tensor.
  *
  * Q4_K is a 256-weight super-block split into eight 32-weight sub-blocks.
@@ -294,5 +306,51 @@ int q6_k_dequantize_block(const Q6_KBlock *block, float *output);
  * or result is null; otherwise return 1.
  */
 int q6_k_dot_f32(const Q6_KBlock *block, const float *input, float *result);
+
+/*
+ * Activations quantized to int8 for integer dot-product kernels.
+ *
+ * Each group of ACTIVATION_Q8_GROUP consecutive floats shares one scale:
+ * approximately input[i] == values[i] * scales[i / 32]. sums[g] holds the
+ * integer sum of group g's values, needed by formats with per-sub-block
+ * minimum offsets (Q4_K).
+ */
+#define ACTIVATION_Q8_GROUP 32
+
+int quantize_activations_q8(const float *input, int count,
+                            int8_t *values, float *scales, int32_t *sums);
+
+/*
+ * Integer dot products between one packed weight block and pre-quantized
+ * activations. q points to the block's 32 (or 256 for K formats) int8
+ * activation values; scales/sums are the matching per-32 group entries.
+ * Return 0 on null pointers, 1 otherwise.
+ */
+int q5_0_dot_q8(const Q5_0Block *block, const int8_t *q,
+                float activation_scale, float *result);
+int q8_0_dot_q8(const Q8_0Block *block, const int8_t *q,
+                float activation_scale, float *result);
+int q4_k_dot_q8(const Q4_KBlock *block, const int8_t *q,
+                const float *activation_scales,
+                const int32_t *activation_sums, float *result);
+int q6_k_dot_q8(const Q6_KBlock *block, const int8_t *q,
+                const float *activation_scales, float *result);
+
+/*
+ * Row-level integer dots: walk `blocks` consecutive packed blocks starting at
+ * row (raw tensor bytes, possibly unaligned) against pre-quantized
+ * activations. scales/sums start at the row's first 32-element group.
+ * Equivalent to summing the per-block *_dot_q8 results. Return 0 on null
+ * pointers, 1 otherwise.
+ */
+int q5_0_row_dot_q8(const unsigned char *row, uint64_t blocks,
+                    const int8_t *q, const float *scales, float *result);
+int q8_0_row_dot_q8(const unsigned char *row, uint64_t blocks,
+                    const int8_t *q, const float *scales, float *result);
+int q4_k_row_dot_q8(const unsigned char *row, uint64_t blocks,
+                    const int8_t *q, const float *scales,
+                    const int32_t *sums, float *result);
+int q6_k_row_dot_q8(const unsigned char *row, uint64_t blocks,
+                    const int8_t *q, const float *scales, float *result);
 
 #endif

@@ -602,14 +602,14 @@ int qwen2_weight_matvec(
         int succeeded;
         if (active_weight_profile == nullptr) {
             // No clock reads or per-format bookkeeping on the unprofiled path.
-            succeeded = quantized_tensor_matvec_f32(&packed, input, input_count, output, output_count);
+            succeeded = quantized_tensor_matvec_act_q8(&packed, input, input_count, output, output_count);
         } else {
             double *seconds;
             unsigned long long *calls;
             weight_profile_targets(tensor->type, name, &seconds, &calls);
             {
                 OperationTimer timer(seconds != nullptr, seconds);
-                succeeded = quantized_tensor_matvec_f32(&packed, input, input_count, output, output_count);
+                succeeded = quantized_tensor_matvec_act_q8(&packed, input, input_count, output, output_count);
             }
             if (succeeded && calls != nullptr) ++*calls;
         }
@@ -683,7 +683,7 @@ static int qwen2_weight_matmul(
         } else {
             GgufQuantizedTensorView view;
             if (gguf_get_quantized_tensor_view(file, name, &view))
-                succeeded = quantized_tensor_matmul_f32(&view, inputs, input_count,
+                succeeded = quantized_tensor_matmul_act_q8(&view, inputs, input_count,
                                                         batch_count, outputs, output_count);
         }
     }

@@ -59,7 +59,7 @@ int tensor_matvec_f32(
         return 0;
     }
 #ifdef _OPENMP
-#pragma omp parallel for schedule(static)
+#pragma omp parallel for schedule(dynamic, 16)
 #endif
     for (int i = 0; i < rows; i ++) {
         float row_sum = 0.0f;
@@ -80,7 +80,7 @@ int tensor_matmul_f32(
         return 0;
     }
 #ifdef _OPENMP
-#pragma omp parallel for schedule(static)
+#pragma omp parallel for schedule(dynamic, 16)
 #endif
     for (int row = 0; row < rows; ++row) {
         const float *weights = matrix + (size_t)row * columns;

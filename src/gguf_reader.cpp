@@ -1,4 +1,5 @@
 #include "gguf_reader.h"
+#include "quantization.h"
 
 #include <limits.h>
 #include <stdio.h>
@@ -10,6 +11,13 @@
 #include <sys/mman.h>
 #include <sys/stat.h>
 #include <unistd.h>
+
+/* See GgufFile::q5_0_repacked in gguf_reader.h. */
+typedef struct Q5_0RepackEntry {
+    const char *name;        // owned by the matching GgufTensorInfo::name
+    Q8_0Block *blocks;        // malloc'd; block_count entries
+    uint64_t block_count;
+} Q5_0RepackEntry;
 
 #define GGUF_HEADER_SIZE 24
 #define GGUF_MAX_METADATA_ENTRIES 1000000
@@ -570,6 +578,101 @@ int gguf_get_f32_tensor_view(const GgufFile *file, const char *name,
     return 1;
 }
 
+static const Q5_0RepackEntry *find_q5_0_repack(const GgufFile *file, const char *name)
+{
+    const Q5_0RepackEntry *entries = (const Q5_0RepackEntry *)file->q5_0_repacked;
+    for (uint64_t i = 0; i < file->q5_0_repacked_count; ++i) {
+        if (strcmp(entries[i].name, name) == 0) {
+            return &entries[i];
+        }
+    }
+    return nullptr;
+}
+
+/* Called once, after gguf_open() finishes parsing tensors. Repacking a few
+ * hundred megabytes of Q5_0 weights into Q8_0 layout is a one-time, startup
+ * cost in exchange for removing the fifth-bit unpack from every dot product
+ * during generation. A tensor that fails any check here is simply left on
+ * the slower Q5_0 path; this never fails gguf_open(). */
+static void build_q5_0_repack_cache(GgufFile *file)
+{
+    file->q5_0_repacked = nullptr;
+    file->q5_0_repacked_count = 0;
+    if (file->tensors == nullptr || file->tensor_count == 0) {
+        return;
+    }
+
+    Q5_0RepackEntry *entries =
+        (Q5_0RepackEntry *)malloc(sizeof(Q5_0RepackEntry) * file->tensor_count);
+    if (entries == nullptr) {
+        return;
+    }
+    uint64_t count = 0;
+
+    for (uint64_t i = 0; i < file->tensor_count; ++i) {
+        const GgufTensorInfo *tensor = &file->tensors[i];
+        if (tensor->type != ENGINE_GGML_TYPE_Q5_0) {
+            continue;
+        }
+
+        uint64_t element_count = 1;
+        int shape_ok = 1;
+        for (uint32_t d = 0; d < tensor->dimension_count; ++d) {
+            uint64_t dimension = tensor->dimensions[d];
+            if (dimension == 0 || element_count > UINT64_MAX / dimension) {
+                shape_ok = 0;
+                break;
+            }
+            element_count *= dimension;
+        }
+        if (!shape_ok || tensor->dimension_count == 0 ||
+            element_count % Q5_0_BLOCK_ELEMENTS != 0) {
+            continue;
+        }
+        uint64_t block_count = element_count / Q5_0_BLOCK_ELEMENTS;
+        if (block_count > UINT64_MAX / Q5_0_BLOCK_BYTES ||
+            tensor->byte_size != block_count * Q5_0_BLOCK_BYTES ||
+            block_count > SIZE_MAX / sizeof(Q8_0Block)) {
+            continue;
+        }
+
+        const unsigned char *source = (const unsigned char *)gguf_tensor_data(file, tensor);
+        if (source == nullptr) {
+            continue;
+        }
+
+        Q8_0Block *repacked = (Q8_0Block *)malloc((size_t)block_count * sizeof(Q8_0Block));
+        if (repacked == nullptr) {
+            continue;
+        }
+        int failed = 0;
+        for (uint64_t b = 0; b < block_count; ++b) {
+            Q5_0Block block;
+            memcpy(&block, source + b * Q5_0_BLOCK_BYTES, sizeof(block));
+            if (!q5_0_repack_to_q8_0(&block, &repacked[b])) {
+                failed = 1;
+                break;
+            }
+        }
+        if (failed) {
+            free(repacked);
+            continue;
+        }
+
+        entries[count].name = tensor->name;
+        entries[count].blocks = repacked;
+        entries[count].block_count = block_count;
+        ++count;
+    }
+
+    if (count == 0) {
+        free(entries);
+        return;
+    }
+    file->q5_0_repacked = entries;
+    file->q5_0_repacked_count = count;
+}
+
 int gguf_get_quantized_tensor_view(
     const GgufFile *file,
     const char *name,
@@ -633,6 +736,17 @@ int gguf_get_quantized_tensor_view(
     view->block_elements = block_elements;
     view->block_bytes = block_bytes;
     view->block_count = block_count;
+
+    if (tensor->type == ENGINE_GGML_TYPE_Q5_0) {
+        const Q5_0RepackEntry *entry = find_q5_0_repack(file, name);
+        if (entry != nullptr && entry->block_count == block_count) {
+            /* Hand back the lossless Q8_0-layout copy; callers dispatch on
+             * ggml_type and get the faster aligned kernels for free. */
+            view->data = (const unsigned char *)entry->blocks;
+            view->ggml_type = ENGINE_GGML_TYPE_Q8_0;
+            view->block_bytes = Q8_0_BLOCK_BYTES;
+        }
+    }
     return 1;
 }
 
@@ -651,6 +765,13 @@ void gguf_close(GgufFile *file)
         for (i = 0; i < file->tensor_count; ++i) {
             free(file->tensors[i].name);
         }
+    }
+    if (file->q5_0_repacked != NULL) {
+        Q5_0RepackEntry *entries = (Q5_0RepackEntry *)file->q5_0_repacked;
+        for (i = 0; i < file->q5_0_repacked_count; ++i) {
+            free(entries[i].blocks);
+        }
+        free(entries);
     }
     free(file->metadata);
     free(file->tensors);
@@ -779,6 +900,7 @@ int gguf_open(const char *path, GgufFile *file, char *error, int error_capacity)
         gguf_close(file);
         return 0;
     }
+    build_q5_0_repack_cache(file);
     if (error != NULL && error_capacity > 0) {
         error[0] = '\0';
     }

@@ -47,6 +47,10 @@ int generate_prepare_prompt(const Model *model, const char *user_prompt,
  * token_count + max_tokens positions and positioned at zero; callers reusing a
  * state must call inference_state_reset first.
  *
+ * repeat_penalty <= 1.0 disables the repetition penalty; above 1.0, every
+ * token already seen in the prompt or generated so far has its logit pulled
+ * toward zero before sampling, which keeps greedy decoding from looping.
+ *
  * prompt_start_usage is the clock reading taken before prompt preparation; it
  * anchors time-to-first-token so that measurement spans prompt processing.
  * Pass an unavailable snapshot to skip that measurement.
@@ -57,6 +61,7 @@ int generate_prepare_prompt(const Model *model, const char *user_prompt,
 int generate_run(const Model *model, InferenceState *state,
                  const int *token_ids, int token_count,
                  int max_tokens, float temperature, float top_p,
+                 float repeat_penalty,
                  const UsageSnapshot *prompt_start_usage,
                  GenerateTokenFn on_token, void *user,
                  GenerateResult *result, char *error, int error_capacity);

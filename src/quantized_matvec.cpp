@@ -150,7 +150,7 @@ int quantized_tensor_matvec_f32(
 
     int failed = 0;
 #ifdef _OPENMP
-#pragma omp parallel for schedule(static) reduction(|:failed)
+#pragma omp parallel for schedule(dynamic, 16) reduction(|:failed)
 #endif
     for (int row = 0; row < output_count; ++row) {
         if (!quantized_row_dot_f32(matrix, input, (uint64_t)row,
@@ -192,7 +192,7 @@ int quantized_tensor_matmul_f32(
 
     int failed = 0;
 #ifdef _OPENMP
-#pragma omp parallel for schedule(static) reduction(|:failed)
+#pragma omp parallel for schedule(dynamic, 16) reduction(|:failed)
 #endif
     for (int row = 0; row < output_count; ++row) {
         for (int batch = 0; batch < batch_count; ++batch)
@@ -220,5 +220,165 @@ int quantized_tensor_matmul_f32(
             if (failed) break;
         }
     }
+    return !failed;
+}
+
+#include <stdlib.h>
+
+/* Validate the view's layout the same way the f32 paths do and report the
+ * block geometry. Returns 0 on any mismatch. */
+static int quantized_view_geometry(
+    const GgufQuantizedTensorView *matrix,
+    int input_count, int output_count,
+    uint64_t *blocks_per_row_out
+)
+{
+    if (matrix == nullptr || matrix->data == nullptr ||
+        matrix->dimension_count != 2) return 0;
+    uint64_t columns = matrix->dimensions[0], rows = matrix->dimensions[1];
+    if (columns == 0 || rows == 0 || columns > INT_MAX || rows > INT_MAX ||
+        input_count != (int)columns || output_count != (int)rows) return 0;
+
+    uint64_t block_elements = 0, block_bytes = 0;
+    switch (matrix->ggml_type) {
+        case ENGINE_GGML_TYPE_Q5_0: block_elements = Q5_0_BLOCK_ELEMENTS; block_bytes = Q5_0_BLOCK_BYTES; break;
+        case ENGINE_GGML_TYPE_Q8_0: block_elements = Q8_0_BLOCK_ELEMENTS; block_bytes = Q8_0_BLOCK_BYTES; break;
+        case ENGINE_GGML_TYPE_Q4_K: block_elements = Q4_K_BLOCK_ELEMENTS; block_bytes = Q4_K_BLOCK_BYTES; break;
+        case ENGINE_GGML_TYPE_Q6_K: block_elements = Q6_K_BLOCK_ELEMENTS; block_bytes = Q6_K_BLOCK_BYTES; break;
+        default: return 0;
+    }
+    if (matrix->block_elements != block_elements ||
+        matrix->block_bytes != block_bytes ||
+        columns % block_elements != 0) return 0;
+    uint64_t blocks_per_row = columns / block_elements;
+    if (blocks_per_row > UINT64_MAX / rows ||
+        matrix->block_count != blocks_per_row * rows ||
+        columns > UINT64_MAX / rows || matrix->element_count != columns * rows ||
+        matrix->block_count > SIZE_MAX / block_bytes) return 0;
+    *blocks_per_row_out = blocks_per_row;
+    return 1;
+}
+
+/* One row's integer dot against pre-quantized activations. */
+static int quantized_row_dot_act_q8(
+    const GgufQuantizedTensorView *matrix,
+    const int8_t *values, const float *scales, const int32_t *sums,
+    uint64_t row, uint64_t blocks_per_row, float *result
+)
+{
+    const unsigned char *row_data =
+        matrix->data + row * blocks_per_row * matrix->block_bytes;
+
+    switch (matrix->ggml_type) {
+        case ENGINE_GGML_TYPE_Q5_0:
+            return q5_0_row_dot_q8(row_data, blocks_per_row, values, scales,
+                                   result);
+        case ENGINE_GGML_TYPE_Q8_0:
+            return q8_0_row_dot_q8(row_data, blocks_per_row, values, scales,
+                                   result);
+        case ENGINE_GGML_TYPE_Q4_K:
+            return q4_k_row_dot_q8(row_data, blocks_per_row, values, scales,
+                                   sums, result);
+        case ENGINE_GGML_TYPE_Q6_K:
+            return q6_k_row_dot_q8(row_data, blocks_per_row, values, scales,
+                                   result);
+        default:
+            return 0;
+    }
+}
+
+int quantized_tensor_matvec_act_q8(
+    const GgufQuantizedTensorView *matrix,
+    const float *input,
+    int input_count,
+    float *output,
+    int output_count
+)
+{
+    if (input == nullptr || output == nullptr ||
+        input_count <= 0 || output_count <= 0) return 0;
+    uint64_t blocks_per_row = 0;
+    if (!quantized_view_geometry(matrix, input_count, output_count,
+                                 &blocks_per_row)) return 0;
+
+    const int groups = input_count / ACTIVATION_Q8_GROUP;
+    int8_t *values = (int8_t *)malloc((size_t)input_count);
+    float *scales = (float *)malloc((size_t)groups * sizeof(float));
+    int32_t *sums = (int32_t *)malloc((size_t)groups * sizeof(int32_t));
+    if (values == nullptr || scales == nullptr || sums == nullptr ||
+        !quantize_activations_q8(input, input_count, values, scales, sums)) {
+        free(values); free(scales); free(sums);
+        return quantized_tensor_matvec_f32(matrix, input, input_count,
+                                           output, output_count);
+    }
+
+    int failed = 0;
+#ifdef _OPENMP
+#pragma omp parallel for schedule(dynamic, 16) reduction(|:failed)
+#endif
+    for (int row = 0; row < output_count; ++row) {
+        if (!quantized_row_dot_act_q8(matrix, values, scales, sums,
+                                      (uint64_t)row, blocks_per_row,
+                                      &output[row])) {
+            failed = 1;
+        }
+    }
+    free(values); free(scales); free(sums);
+    return !failed;
+}
+
+int quantized_tensor_matmul_act_q8(
+    const GgufQuantizedTensorView *matrix,
+    const float *inputs,
+    int input_count,
+    int batch_count,
+    float *outputs,
+    int output_count
+)
+{
+    if (inputs == nullptr || outputs == nullptr || batch_count <= 0 ||
+        input_count <= 0 || output_count <= 0 ||
+        (size_t)batch_count > SIZE_MAX / (size_t)input_count ||
+        (size_t)batch_count > SIZE_MAX / (size_t)output_count) return 0;
+    uint64_t blocks_per_row = 0;
+    if (!quantized_view_geometry(matrix, input_count, output_count,
+                                 &blocks_per_row)) return 0;
+
+    const int groups = input_count / ACTIVATION_Q8_GROUP;
+    int8_t *values = (int8_t *)malloc((size_t)batch_count * input_count);
+    float *scales = (float *)malloc((size_t)batch_count * groups * sizeof(float));
+    int32_t *sums = (int32_t *)malloc((size_t)batch_count * groups * sizeof(int32_t));
+    int quantize_ok = values != nullptr && scales != nullptr && sums != nullptr;
+    for (int batch = 0; quantize_ok && batch < batch_count; ++batch) {
+        quantize_ok = quantize_activations_q8(
+            inputs + (size_t)batch * input_count, input_count,
+            values + (size_t)batch * input_count,
+            scales + (size_t)batch * groups,
+            sums + (size_t)batch * groups);
+    }
+    if (!quantize_ok) {
+        free(values); free(scales); free(sums);
+        return quantized_tensor_matmul_f32(matrix, inputs, input_count,
+                                           batch_count, outputs, output_count);
+    }
+
+    int failed = 0;
+#ifdef _OPENMP
+#pragma omp parallel for schedule(dynamic, 16) reduction(|:failed)
+#endif
+    for (int row = 0; row < output_count; ++row) {
+        for (int batch = 0; batch < batch_count; ++batch) {
+            if (!quantized_row_dot_act_q8(
+                    matrix,
+                    values + (size_t)batch * input_count,
+                    scales + (size_t)batch * groups,
+                    sums + (size_t)batch * groups,
+                    (uint64_t)row, blocks_per_row,
+                    &outputs[(size_t)batch * output_count + row])) {
+                failed = 1;
+            }
+        }
+    }
+    free(values); free(scales); free(sums);
     return !failed;
 }

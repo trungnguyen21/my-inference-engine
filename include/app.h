@@ -13,6 +13,9 @@ typedef struct AppConfig {
     int max_tokens;
     float temperature;
     float top_p;
+    float repeat_penalty; /* 1.0 disables; >1.0 discourages already-seen tokens */
+    unsigned long seed; /* RNG seed for temperature > 0; ignored otherwise */
+    int has_seed; /* 0 means --seed was not passed: use a random seed */
     int profile; /* collect and print operation timings; disabled by default */
 } AppConfig;
 
