@@ -31,12 +31,16 @@ type fakeGenerator struct {
 	gotCtx    context.Context // the request context the handler passed through
 	gotMax    int             // records what the handler passed through
 	gotTemp   float32
+	gotTopP   float32
+	gotPen    float32
 	gotPrompt string
 }
 
 func (f *fakeGenerator) Generate(ctx context.Context, prompt string, maxTokens int,
-	temperature float32, onToken engine.TokenFunc) (engine.Stats, error) {
+	temperature, topP, repeatPenalty float32,
+	onToken engine.TokenFunc) (engine.Stats, error) {
 	f.gotPrompt, f.gotMax, f.gotTemp = prompt, maxTokens, temperature
+	f.gotTopP, f.gotPen = topP, repeatPenalty
 	f.gotCtx = ctx
 	if f.err != nil {
 		return engine.Stats{}, f.err

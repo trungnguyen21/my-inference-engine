@@ -35,7 +35,35 @@ type generateRequest struct {
 	Prompt    string `json:"prompt"`
 	MaxTokens int    `json:"max_tokens"`
 	Stream    bool   `json:"stream"`
+
+	// Temperature's zero value (0) and its default (0, greedy) coincide, so
+	// an omitted field and an explicit 0 are indistinguishable and that is
+	// fine: both mean greedy decoding.
+	Temperature float32 `json:"temperature"`
+
+	// TopP and RepeatPenalty are pointers so "the client did not send this
+	// field" (nil) can be told apart from "the client sent 0" — which matters
+	// here because their defaults are not 0. defaultTopP/defaultRepeatPenalty
+	// below are applied only when the pointer is nil.
+	TopP          *float32 `json:"top_p,omitempty"`
+	RepeatPenalty *float32 `json:"repeat_penalty,omitempty"`
 }
+
+const (
+	defaultTopP = 1.0 // nucleus sampling disabled; only matters when temperature > 0
+
+	// defaultRepeatPenalty is intentionally NOT a no-op (1.0). Greedy decoding
+	// on this model reliably collapses into repeating a short token/phrase for
+	// the rest of the budget -- confirmed against the real model: the same
+	// prompt that loops into "1, 1, 1, 1, ..." for 96 tokens at penalty 1.0
+	// produces normal prose at penalty 1.3. Defaulting it on fixes that for
+	// every caller, including ones written before this field existed, without
+	// requiring them to opt in. 1.3 is also a widely-used default for small
+	// models elsewhere (e.g. llama.cpp's own default is 1.1; HF text-gen
+	// examples commonly use 1.2-1.3 for sub-1B models). A caller that wants it
+	// off can still pass 1.0 explicitly.
+	defaultRepeatPenalty = 1.3
+)
 
 type generateResponse struct {
 	Text            string `json:"text"`
@@ -138,7 +166,8 @@ func (i identity) String() string {
 type generator interface {
 	// ctx carries the HTTP request's lifetime. The pool uses it to stop
 	// waiting for a worker when the client has already hung up.
-	Generate(ctx context.Context, prompt string, maxTokens int, temperature float32,
+	Generate(ctx context.Context, prompt string, maxTokens int,
+		temperature, topP, repeatPenalty float32,
 		onToken engine.TokenFunc) (engine.Stats, error)
 }
 
@@ -339,6 +368,31 @@ func (s *server) handleGenerate(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Ranges match what the engine itself enforces (sampler_sample validates
+	// temperature/top_p; see API.md), so a bad value is caught here as a 400
+	// instead of reaching the engine and surfacing as a less useful 500.
+	if req.Temperature < 0 || req.Temperature > 1 {
+		writeError(w, http.StatusBadRequest, "temperature must be between 0 and 1")
+		return
+	}
+	topP := float32(defaultTopP)
+	if req.TopP != nil {
+		if *req.TopP < 0 || *req.TopP > 1 {
+			writeError(w, http.StatusBadRequest, "top_p must be between 0 and 1")
+			return
+		}
+		topP = *req.TopP
+	}
+	repeatPenalty := float32(defaultRepeatPenalty)
+	if req.RepeatPenalty != nil {
+		if *req.RepeatPenalty <= 0 {
+			writeError(w, http.StatusBadRequest,
+				"repeat_penalty must be positive (1.0 or below disables it)")
+			return
+		}
+		repeatPenalty = *req.RepeatPenalty
+	}
+
 	gen := s.generator()
 	if gen == nil {
 		w.Header().Set("Retry-After", "5")
@@ -347,13 +401,14 @@ func (s *server) handleGenerate(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if req.Stream {
-		s.streamGenerate(w, r, gen, prompt, req.MaxTokens)
+		s.streamGenerate(w, r, gen, prompt, req.MaxTokens, req.Temperature, topP, repeatPenalty)
 		return
 	}
 
 	var sb strings.Builder
 	start := time.Now()
-	stats, err := gen.Generate(r.Context(), prompt, req.MaxTokens, 0,
+	stats, err := gen.Generate(r.Context(), prompt, req.MaxTokens,
+		req.Temperature, topP, repeatPenalty,
 		func(piece string) bool {
 			sb.WriteString(piece)
 			return true
@@ -383,7 +438,8 @@ func (s *server) handleGenerate(w http.ResponseWriter, r *http.Request) {
 // arrives already validated and trimmed, so only the streaming mechanics
 // remain.
 func (s *server) streamGenerate(w http.ResponseWriter, r *http.Request,
-	gen generator, prompt string, maxTokens int) {
+	gen generator, prompt string, maxTokens int,
+	temperature, topP, repeatPenalty float32) {
 
 	flusher, ok := w.(http.Flusher)
 	if !ok {
@@ -427,32 +483,33 @@ func (s *server) streamGenerate(w http.ResponseWriter, r *http.Request,
 	// The pool holds a session for this whole call, so `start` measures
 	// generation and excludes any time spent waiting for a free worker.
 	start := time.Now()
-	stats, genErr := gen.Generate(r.Context(), prompt, maxTokens, 0, func(piece string) bool {
-		select {
-		case <-clientGone:
-			disconnected = true
-			return false
-		default:
-		}
+	stats, genErr := gen.Generate(r.Context(), prompt, maxTokens,
+		temperature, topP, repeatPenalty, func(piece string) bool {
+			select {
+			case <-clientGone:
+				disconnected = true
+				return false
+			default:
+			}
 
-		// Marshal rather than format: a piece may contain quotes, backslashes,
-		// or a newline, and a raw newline would split one event into two.
-		payload, err := json.Marshal(streamToken{Token: piece})
-		if err != nil {
-			log.Printf("stream: marshal token: %v", err)
-			return false
-		}
+			// Marshal rather than format: a piece may contain quotes, backslashes,
+			// or a newline, and a raw newline would split one event into two.
+			payload, err := json.Marshal(streamToken{Token: piece})
+			if err != nil {
+				log.Printf("stream: marshal token: %v", err)
+				return false
+			}
 
-		ensureHeader()
-		if err := writeEvent("", payload); err != nil {
-			// The connection is gone; further writes would fail too.
-			log.Printf("stream: write token: %v", err)
-			disconnected = true
-			return false
-		}
-		flusher.Flush()
-		return true
-	})
+			ensureHeader()
+			if err := writeEvent("", payload); err != nil {
+				// The connection is gone; further writes would fail too.
+				log.Printf("stream: write token: %v", err)
+				disconnected = true
+				return false
+			}
+			flusher.Flush()
+			return true
+		})
 
 	if genErr != nil {
 		if !wroteHeader {

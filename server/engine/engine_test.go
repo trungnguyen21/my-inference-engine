@@ -76,7 +76,7 @@ func TestGenerate(t *testing.T) {
 	defer s.Close()
 
 	var sb strings.Builder
-	stats, err := s.Generate("What's the capital of France?", 16, 0,
+	stats, err := s.Generate("What's the capital of France?", 16, 0, 1, 1,
 		func(piece string) bool { sb.WriteString(piece); return true })
 	if err != nil {
 		t.Fatalf("Generate: %v", err)
@@ -104,7 +104,7 @@ func TestSessionIsReusable(t *testing.T) {
 		{"What's 2+2?", "4"},
 	} {
 		var sb strings.Builder
-		if _, err := s.Generate(tc.prompt, 16, 0,
+		if _, err := s.Generate(tc.prompt, 16, 0, 1, 1,
 			func(p string) bool { sb.WriteString(p); return true }); err != nil {
 			t.Fatalf("Generate(%q): %v", tc.prompt, err)
 		}
@@ -125,7 +125,7 @@ func TestCallbackCanStopEarly(t *testing.T) {
 	defer s.Close()
 
 	pieces := 0
-	stats, err := s.Generate("Count to twenty.", 16, 0, func(string) bool {
+	stats, err := s.Generate("Count to twenty.", 16, 0, 1, 1, func(string) bool {
 		pieces++
 		return pieces < 2
 	})
@@ -150,24 +150,87 @@ func TestInvalidRequestsAreErrors(t *testing.T) {
 	keep := func(string) bool { return true }
 
 	for _, tc := range []struct {
-		name        string
-		maxTokens   int
-		temperature float32
+		name          string
+		maxTokens     int
+		temperature   float32
+		topP          float32
+		repeatPenalty float32
 	}{
-		{"nonzero temperature", 16, 0.8},
-		{"exceeds session context", 100000, 0},
-		{"zero max tokens", 0, 0},
+		// Nonzero temperature used to be rejected outright; it is now valid,
+		// real nucleus sampling (see TestGenerateWithTemperature), so it is
+		// deliberately absent from this table.
+		{"exceeds session context", 100000, 0, 1, 1},
+		{"zero max tokens", 0, 0, 1, 1},
+		{"out-of-range temperature", 16, 5.0, 1, 1},
+		{"out-of-range top_p", 16, 0, 5.0, 1},
 	} {
-		if _, err := s.Generate("hi", tc.maxTokens, tc.temperature, keep); err == nil {
+		if _, err := s.Generate("hi", tc.maxTokens, tc.temperature, tc.topP,
+			tc.repeatPenalty, keep); err == nil {
 			t.Errorf("%s: expected an error", tc.name)
 		}
 	}
 
 	// A rejected request must leave the session usable.
 	var sb strings.Builder
-	if _, err := s.Generate("What's 2+2?", 8, 0,
+	if _, err := s.Generate("What's 2+2?", 8, 0, 1, 1,
 		func(p string) bool { sb.WriteString(p); return true }); err != nil {
 		t.Fatalf("session unusable after rejections: %v", err)
+	}
+}
+
+// Nonzero temperature was rejected outright before this change; this is the
+// fix. A low top_p keeps the nucleus small enough that output stays coherent
+// English rather than near-uniform random tokens, which is what makes this a
+// meaningful check rather than "did not crash".
+func TestGenerateWithTemperature(t *testing.T) {
+	m := openModel(t)
+	s, err := m.NewSession(192)
+	if err != nil {
+		t.Fatalf("NewSession: %v", err)
+	}
+	defer s.Close()
+
+	var sb strings.Builder
+	_, err = s.Generate("What's the capital of France?", 16, 0.7, 0.9, 1,
+		func(p string) bool { sb.WriteString(p); return true })
+	if err != nil {
+		t.Fatalf("Generate with nonzero temperature: %v", err)
+	}
+	if !strings.Contains(sb.String(), "Paris") {
+		t.Errorf("output %q should still mention Paris at a modest temperature", sb.String())
+	}
+}
+
+// The actual bug this project hit: greedy decoding (temperature 0) on this
+// model reliably collapses into repeating a short phrase for the rest of the
+// token budget. repeat_penalty is the fix, and it works independently of
+// temperature. Verified against the real model, not asserted in the abstract.
+func TestRepeatPenaltyBreaksGreedyLoop(t *testing.T) {
+	m := openModel(t)
+	s, err := m.NewSession(512)
+	if err != nil {
+		t.Fatalf("NewSession: %v", err)
+	}
+	defer s.Close()
+
+	const loopingPrompt = "Continue this sequence: 1, 1, 1, 1,"
+
+	var noPenalty strings.Builder
+	if _, err := s.Generate(loopingPrompt, 96, 0, 1, 1,
+		func(p string) bool { noPenalty.WriteString(p); return true }); err != nil {
+		t.Fatalf("Generate (no penalty): %v", err)
+	}
+	if !strings.Contains(noPenalty.String(), "1, 1, 1, 1, 1, 1, 1, 1, 1, 1") {
+		t.Skipf("repro did not reproduce the known loop this run; got %q", noPenalty.String())
+	}
+
+	var withPenalty strings.Builder
+	if _, err := s.Generate(loopingPrompt, 96, 0, 1, 1.3,
+		func(p string) bool { withPenalty.WriteString(p); return true }); err != nil {
+		t.Fatalf("Generate (repeat_penalty 1.3): %v", err)
+	}
+	if strings.Contains(withPenalty.String(), "1, 1, 1, 1, 1, 1, 1, 1, 1, 1") {
+		t.Errorf("repeat_penalty did not break the loop; got %q", withPenalty.String())
 	}
 }
 
@@ -201,7 +264,7 @@ func TestConcurrentSessions(t *testing.T) {
 			}
 			defer s.Close()
 			var sb strings.Builder
-			_, err = s.Generate(prompts[i], 16, 0,
+			_, err = s.Generate(prompts[i], 16, 0, 1, 1,
 				func(p string) bool { sb.WriteString(p); return true })
 			mu.Lock()
 			outs[i], errs[i] = sb.String(), err

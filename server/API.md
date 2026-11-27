@@ -20,14 +20,28 @@ session with a pool so requests genuinely overlap.
 }
 ```
 
-| Field        | Type   | Required | Rules |
-|--------------|--------|----------|-------|
-| `prompt`     | string | yes      | non-empty; at most `engine.PromptCapacity()` bytes |
-| `max_tokens` | int    | yes      | `1 <= max_tokens <= maxTokensLimit` (server flag) |
-| `stream`     | bool   | no       | `false` (default) returns one JSON object; `true` streams SSE |
+| Field            | Type   | Required | Rules |
+|------------------|--------|----------|-------|
+| `prompt`         | string | yes      | non-empty; at most `engine.PromptCapacity()` bytes |
+| `max_tokens`     | int    | yes      | `1 <= max_tokens <= maxTokensLimit` (server flag) |
+| `stream`         | bool   | no       | `false` (default) returns one JSON object; `true` streams SSE |
+| `temperature`    | float  | no       | `0` (default) is greedy decoding; `0 <= temperature <= 1` |
+| `top_p`          | float  | no       | `1.0` (default, disabled) if omitted; `0 <= top_p <= 1`. Only has an effect when `temperature > 0` |
+| `repeat_penalty` | float  | no       | **`1.3` if omitted** — see below; must be positive |
 
-There is deliberately **no `temperature`**. Only greedy decoding is implemented,
-so accepting the field would advertise behaviour the engine does not have.
+Real sampling now exists (it did not when this doc first said otherwise):
+`temperature` and `top_p` are genuine nucleus sampling, not stubs.
+
+**`repeat_penalty` defaults to `1.3`, not `1.0` (disabled), and this is
+deliberate.** Pure greedy decoding (`temperature: 0`, the server's own
+default) on this model reliably collapses into repeating a short token or
+phrase for the rest of the output — confirmed against the real model: the
+prompt `"Continue this sequence: 1, 1, 1, 1,"` at `max_tokens: 96` produces
+`"1, 1, 1, 1, ..."` for the entire budget at `repeat_penalty: 1.0`, and normal
+prose at `1.3`. Defaulting it on fixes that for every caller, including ones
+written before this field existed, without requiring them to opt in. Pass
+`"repeat_penalty": 1.0` explicitly to disable it and get pure greedy decoding.
+Values `<= 1.0` are a no-op; there is no upper bound enforced beyond "positive".
 
 ### Success — `200`
 
@@ -60,7 +74,7 @@ All errors use the same body:
 
 | Status | When |
 |--------|------|
-| `400`  | malformed JSON, missing/empty `prompt`, `prompt` too long, `max_tokens` out of range, or `max_tokens` large enough that no prompt could fit the session context |
+| `400`  | malformed JSON, missing/empty `prompt`, `prompt` too long, `max_tokens` out of range, `max_tokens` large enough that no prompt could fit the session context, `temperature`/`top_p` outside `[0, 1]`, or `repeat_penalty` not positive |
 | `405`  | any method other than POST |
 | `500`  | the engine failed |
 | `503`  | the server is busy (**Phase 3**; a single-session server may skip this) |

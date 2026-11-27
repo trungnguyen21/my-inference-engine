@@ -23,11 +23,6 @@ struct EngineSession {
     int *prompt_token_ids; /* max_context_tokens entries */
 };
 
-/* Greedy decoding ignores nucleus sampling; pass the no-op value through. */
-#define GREEDY_TOP_P 1.0f
-/* This public API doesn't expose a repetition penalty yet. */
-#define NO_REPEAT_PENALTY 1.0f
-
 static void set_error(char *error, int capacity, const char *message)
 {
     if (error != nullptr && capacity > 0) {
@@ -178,7 +173,7 @@ void engine_session_destroy(EngineSession *session)
 }
 
 int engine_run(EngineSession *session, const char *prompt, int max_tokens,
-               float temperature,
+               float temperature, float top_p, float repeat_penalty,
                EngineTokenFn on_token, void *user,
                EngineStats *stats, char *error, int error_capacity)
 {
@@ -201,11 +196,11 @@ int engine_run(EngineSession *session, const char *prompt, int max_tokens,
         set_error(error, error_capacity, "max_tokens must be positive.");
         return 0;
     }
-    if (temperature != 0.0f) {
-        set_error(error, error_capacity,
-                  "Only greedy decoding is implemented; temperature must be 0.");
-        return 0;
-    }
+    /* temperature and top_p range are validated by sampler_sample inside
+     * generate_run, which reports the same error/return-0 contract as every
+     * other failure here. No need to duplicate that check. repeat_penalty has
+     * no engine-level range error: generate_run treats anything <= 1.0 as a
+     * no-op, which already covers 0, negative, and non-finite values safely. */
     if (strlen(prompt) >= ENGINE_PROMPT_CAPACITY) {
         set_error(error, error_capacity, "Prompt is too long.");
         return 0;
@@ -243,7 +238,7 @@ int engine_run(EngineSession *session, const char *prompt, int max_tokens,
 
     if (!generate_run(&session->handle->model, &session->state,
                       session->prompt_token_ids, prompt_token_count,
-                      max_tokens, temperature, GREEDY_TOP_P, NO_REPEAT_PENALTY,
+                      max_tokens, temperature, top_p, repeat_penalty,
                       &prompt_start_usage,
                       on_token, user, &result, error, error_capacity)) {
         return 0;

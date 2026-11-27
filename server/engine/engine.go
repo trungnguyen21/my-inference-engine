@@ -32,10 +32,12 @@ static int token_trampoline(const char *text, void *user) {
 // function pointer to an exported Go function at the call site. This tiny
 // shim hard-wires the callback instead, so Go only passes data.
 static int engine_run_bridge(EngineSession *session, const char *prompt,
-                             int max_tokens, float temperature, uintptr_t user,
+                             int max_tokens, float temperature, float top_p,
+                             float repeat_penalty, uintptr_t user,
                              EngineStats *stats, char *error, int cap) {
-	return engine_run(session, prompt, max_tokens, temperature,
-	                  token_trampoline, (void *)user, stats, error, cap);
+	return engine_run(session, prompt, max_tokens, temperature, top_p,
+	                  repeat_penalty, token_trampoline, (void *)user,
+	                  stats, error, cap);
 }
 */
 import "C"
@@ -209,12 +211,23 @@ type TokenFunc func(piece string) bool
 // Generate runs one completion, calling onToken for each piece.
 //
 // The session is rewound first, so a session may serve unlimited sequential
-// requests. temperature must be 0: only greedy decoding is implemented, and a
-// nonzero value is rejected rather than silently ignored.
+// requests.
+//
+// Sampling parameters, all validated by the engine and reported as an error
+// (not silently clamped) when out of range:
+//
+//	temperature    0 is greedy decoding. Above 0, up to 1, scales a softmax
+//	               before sampling.
+//	topP           Nucleus sampling threshold in [0, 1]. Only has an effect
+//	               when temperature > 0.
+//	repeatPenalty  1.0 or below disables it; above 1.0, tokens already seen
+//	               are discouraged. This is what keeps greedy decoding
+//	               (temperature 0) from looping, and works independently of
+//	               temperature/topP.
 //
 // Not safe for concurrent use on one Session.
-func (s *Session) Generate(prompt string, maxTokens int, temperature float32,
-	onToken TokenFunc) (Stats, error) {
+func (s *Session) Generate(prompt string, maxTokens int,
+	temperature, topP, repeatPenalty float32, onToken TokenFunc) (Stats, error) {
 
 	if s == nil || s.ptr == nil {
 		return Stats{}, errors.New("session is closed")
@@ -236,7 +249,7 @@ func (s *Session) Generate(prompt string, maxTokens int, temperature float32,
 
 	var cStats C.EngineStats
 	ok := C.engine_run_bridge(s.ptr, cPrompt, C.int(maxTokens),
-		C.float(temperature), C.uintptr_t(h),
+		C.float(temperature), C.float(topP), C.float(repeatPenalty), C.uintptr_t(h),
 		&cStats, errBuf, errCap)
 
 	stats := Stats{
