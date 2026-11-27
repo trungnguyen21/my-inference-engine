@@ -78,15 +78,27 @@ void engine_session_destroy(EngineSession *session);
  * Rejects with an error, rather than crashing, when the prompt plus max_tokens
  * exceeds the session's context; a server should map that to a 400.
  *
- * temperature must currently be 0 (greedy decoding); nonzero sampling is not
- * implemented and is reported as an error rather than silently ignored.
+ * Sampling parameters, all validated and reported as an error (not silently
+ * clamped) when out of range:
  *
- * There is deliberately no top_p parameter: greedy decoding ignores nucleus
- * sampling entirely, so accepting one would advertise behaviour the engine does
- * not have. Add it here only once real sampling exists.
+ *   temperature    0 is greedy decoding (always picks the highest-logit
+ *                  token). Above 0, up to 1, scales a softmax before sampling.
+ *   top_p          Nucleus sampling threshold in [0, 1]. Only has an effect
+ *                  when temperature > 0; greedy decoding ignores it, so
+ *                  passing anything other than 1.0 alongside temperature 0 is
+ *                  accepted but has no observable effect.
+ *   repeat_penalty Discourages tokens already seen in the prompt or the
+ *                  output so far. 1.0 or below is a no-op; above 1.0, each
+ *                  seen token's logit is pulled toward zero before sampling.
+ *                  This is what keeps greedy decoding (temperature 0) from
+ *                  looping, and it is the primary fix for that failure mode:
+ *                  it works whether or not randomness is enabled.
+ *
+ * All three apply every call; there is no hidden default inside the engine —
+ * a caller who wants repeat_penalty disabled passes 1.0 explicitly.
  */
 int engine_run(EngineSession *session, const char *prompt, int max_tokens,
-               float temperature,
+               float temperature, float top_p, float repeat_penalty,
                EngineTokenFn on_token, void *user,
                EngineStats *stats, char *error, int error_capacity);
 

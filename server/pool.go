@@ -14,7 +14,7 @@ import (
 // keeps the pool's own tests free of the 469 MB model: the acquire/release
 // logic is pure channel work and deserves to be tested as such.
 type session interface {
-	Generate(prompt string, maxTokens int, temperature float32,
+	Generate(prompt string, maxTokens int, temperature, topP, repeatPenalty float32,
 		onToken engine.TokenFunc) (engine.Stats, error)
 	Close()
 }
@@ -148,7 +148,7 @@ func (p *sessionPool) release(s session) {
 // interleave two conversations — but it does mean a long stream occupies a
 // worker for its full duration.
 func (p *sessionPool) Generate(ctx context.Context, prompt string, maxTokens int,
-	temperature float32, onToken engine.TokenFunc) (engine.Stats, error) {
+	temperature, topP, repeatPenalty float32, onToken engine.TokenFunc) (engine.Stats, error) {
 
 	s, err := p.acquire(ctx)
 	if err != nil {
@@ -157,5 +157,5 @@ func (p *sessionPool) Generate(ctx context.Context, prompt string, maxTokens int
 	// Deferred so the session comes back even if Generate panics.
 	defer p.release(s)
 
-	return s.Generate(prompt, maxTokens, temperature, onToken)
+	return s.Generate(prompt, maxTokens, temperature, topP, repeatPenalty, onToken)
 }

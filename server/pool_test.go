@@ -24,7 +24,8 @@ type fakeSession struct {
 	closed   bool
 }
 
-func (f *fakeSession) Generate(prompt string, maxTokens int, temperature float32,
+func (f *fakeSession) Generate(prompt string, maxTokens int,
+	temperature, topP, repeatPenalty float32,
 	onToken engine.TokenFunc) (engine.Stats, error) {
 
 	if f.inFlight != nil {
@@ -85,7 +86,7 @@ func TestPoolCapsConcurrency(t *testing.T) {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			if _, err := pool.Generate(context.Background(), "hi", 4, 0, nil); err != nil {
+			if _, err := pool.Generate(context.Background(), "hi", 4, 0, 1, 1, nil); err != nil {
 				t.Errorf("Generate: %v", err)
 			}
 		}()
@@ -105,7 +106,7 @@ func TestPoolCapsConcurrency(t *testing.T) {
 func TestPoolReusesSessions(t *testing.T) {
 	pool, _ := newFakePool(2, time.Minute, nil)
 	for i := 0; i < 10; i++ {
-		if _, err := pool.Generate(context.Background(), "hi", 4, 0, nil); err != nil {
+		if _, err := pool.Generate(context.Background(), "hi", 4, 0, 1, 1, nil); err != nil {
 			t.Fatalf("request %d: %v", i, err)
 		}
 	}
@@ -125,12 +126,12 @@ func TestPoolReturnsErrBusyWhenSaturated(t *testing.T) {
 	busy := make(chan struct{})
 	go func() {
 		close(busy)
-		pool.Generate(context.Background(), "hi", 4, 0, nil) // holds the only session
+		pool.Generate(context.Background(), "hi", 4, 0, 1, 1, nil) // holds the only session
 	}()
 	<-busy
 	time.Sleep(20 * time.Millisecond) // let it acquire
 
-	_, err := pool.Generate(context.Background(), "hi", 4, 0, nil)
+	_, err := pool.Generate(context.Background(), "hi", 4, 0, 1, 1, nil)
 	if !errors.Is(err, ErrBusy) {
 		t.Errorf("err = %v, want ErrBusy once the wait expires", err)
 	}
@@ -148,7 +149,7 @@ func TestPoolRespectsCancellationWhileQueued(t *testing.T) {
 	busy := make(chan struct{})
 	go func() {
 		close(busy)
-		pool.Generate(context.Background(), "hi", 4, 0, nil)
+		pool.Generate(context.Background(), "hi", 4, 0, 1, 1, nil)
 	}()
 	<-busy
 	time.Sleep(20 * time.Millisecond)
@@ -160,7 +161,7 @@ func TestPoolRespectsCancellationWhileQueued(t *testing.T) {
 	}()
 
 	start := time.Now()
-	_, err := pool.Generate(ctx, "hi", 4, 0, nil)
+	_, err := pool.Generate(ctx, "hi", 4, 0, 1, 1, nil)
 	if !errors.Is(err, context.Canceled) {
 		t.Errorf("err = %v, want context.Canceled", err)
 	}
@@ -185,7 +186,7 @@ func TestPoolReleasesSessionOnPanic(t *testing.T) {
 				t.Error("expected the panic to propagate to the caller")
 			}
 		}()
-		pool.Generate(context.Background(), "hi", 4, 0, nil)
+		pool.Generate(context.Background(), "hi", 4, 0, 1, 1, nil)
 	}()
 
 	if len(pool.idle) != 1 {
@@ -193,7 +194,7 @@ func TestPoolReleasesSessionOnPanic(t *testing.T) {
 	}
 	// Prove the pool still works.
 	pool.all[0].(*fakeSession).panics = false
-	if _, err := pool.Generate(context.Background(), "hi", 4, 0, nil); err != nil {
+	if _, err := pool.Generate(context.Background(), "hi", 4, 0, 1, 1, nil); err != nil {
 		t.Errorf("pool unusable after a panic: %v", err)
 	}
 }
